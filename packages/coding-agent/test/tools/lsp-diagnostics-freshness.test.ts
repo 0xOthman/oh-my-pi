@@ -1,17 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createLspWritethrough } from "@oh-my-pi/pi-coding-agent/lsp";
+import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import { type FileDiagnosticsResult, FileFormatResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
-import { formatContent, INLINE_DIAGNOSTICS_WAIT_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/lsp/diagnostics";
+import {
+	formatContent,
+	getDiagnosticsForFile,
+	INLINE_DIAGNOSTICS_WAIT_TIMEOUT_MS,
+} from "@oh-my-pi/pi-coding-agent/lsp/diagnostics";
 import type { Diagnostic, LinterClient, LspClient, ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import { EquivalentUriMap, fileToUri } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import type { DeferredDiagnosticsEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { type ptree, TempDir } from "@oh-my-pi/pi-utils";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 const TEST_SERVER: ServerConfig = {
 	command: "test-lsp",
@@ -577,6 +582,72 @@ describe("LSP diagnostics freshness", () => {
 		const lateResult = await late.promise;
 		expect(lateResult.errored).toBe(true);
 		expect(lateResult.messages.some(message => message.includes("completed analysis error"))).toBe(true);
+	});
+
+	it("does not mark a write clean when a push-only server publishes nothing", async () => {
+		const filePath = path.join(tempDir.path(), "broken.ts");
+		const uri = fileToUri(filePath);
+		const client = createClient(tempDir.path(), TEST_SERVER);
+		installVirtualTime(new VirtualClock(Date.now()));
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["test-lsp", TEST_SERVER]]);
+		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+		vi.spyOn(lspClient, "syncContent").mockImplementation(async () => {
+			client.openFiles.set(uri, { version: 1, languageId: "typescript" });
+		});
+		vi.spyOn(lspClient, "notifySaved").mockResolvedValue();
+
+		const writethrough = createLspWritethrough(tempDir.path(), { enableFormat: false, enableDiagnostics: true });
+		const result = await writethrough(filePath, "export const broken: string = 42;\n");
+		expect(result.diagnostics).toBeUndefined();
+	});
+
+	it("warns when a clean linter cannot verify a silent LSP server", async () => {
+		const filePath = path.join(tempDir.path(), "broken.ts");
+		const client = createClient(tempDir.path(), TEST_SERVER);
+		installVirtualTime(new VirtualClock(Date.now()));
+		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+
+		const result = await getDiagnosticsForFile(
+			filePath,
+			tempDir.path(),
+			[
+				["test-lsp", TEST_SERVER],
+				["clean-linter", createFormatter(async (_filePath, content) => content)],
+			],
+			{ timeoutMs: 300 },
+		);
+		expect(result?.summary).toContain("Diagnostics unavailable from test-lsp");
+		expect(result?.messages).toContain("Diagnostics unavailable from test-lsp");
+	});
+
+	it("does not report OK when an explicit diagnostics request observes no publish", async () => {
+		const filePath = path.join(tempDir.path(), "broken.ts");
+		await Bun.write(filePath, "export const broken: string = 42;\n");
+		await initTheme();
+		const client = createClient(tempDir.path(), TEST_SERVER);
+		installVirtualTime(new VirtualClock(Date.now()));
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["test-lsp", TEST_SERVER]]);
+		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+		vi.spyOn(lspClient, "refreshFile").mockResolvedValue();
+		const session: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+		};
+
+		const result = await new LspTool(session).execute("silent-diagnostics", {
+			action: "diagnostics",
+			file: filePath,
+		});
+		expect(result.details?.success).toBe(false);
+		expect(result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining("all language servers failed"),
+		});
 	});
 
 	it("matches published diagnostics when the server renormalizes the document URI", async () => {

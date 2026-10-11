@@ -559,7 +559,7 @@ async function runLspWritethrough(
 		diagnostics ??= {
 			server: servers.map(([name]) => name).join(", "),
 			messages: [],
-			summary: "OK",
+			summary: enableDiagnostics ? "Diagnostics unavailable" : "OK",
 			errored: false,
 		};
 		diagnostics.formatter = formatter;

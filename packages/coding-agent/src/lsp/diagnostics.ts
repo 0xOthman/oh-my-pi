@@ -344,7 +344,7 @@ export async function waitForDiagnostics(
 		if (pullFailure !== undefined) {
 			throw pullFailure instanceof Error ? pullFailure : new Error(String(pullFailure));
 		}
-		return [];
+		throw new Error(`No fresh diagnostics published or pulled within ${timeoutMs}ms`);
 	}
 	client.diagnostics.set(uri, {
 		diagnostics: pulled,
@@ -437,6 +437,7 @@ export async function getDiagnosticsForFile(
 	const relPath = formatPathRelativeToCwd(absolutePath, cwd);
 	const allDiagnostics: Diagnostic[] = [];
 	const serverNames: string[] = [];
+	const failedServers: string[] = [];
 
 	// Wait for diagnostics from all servers in parallel. Each server's whole
 	// pipeline is wrapped in a hard wall-clock bound: the caller's signal is
@@ -480,29 +481,32 @@ export async function getDiagnosticsForFile(
 		}),
 	);
 
-	for (const result of results) {
-		if (result.status === "fulfilled") {
-			serverNames.push(result.value.serverName);
-			allDiagnostics.push(
-				...filterOrphanProjectDiagnostics(
-					absolutePath,
-					result.value.serverName,
-					result.value.serverConfig,
-					result.value.diagnostics,
-				),
-			);
+	for (const [index, result] of results.entries()) {
+		if (result.status === "rejected") {
+			failedServers.push(servers[index]![0]);
+			continue;
 		}
+		serverNames.push(result.value.serverName);
+		allDiagnostics.push(
+			...filterOrphanProjectDiagnostics(
+				absolutePath,
+				result.value.serverName,
+				result.value.serverConfig,
+				result.value.diagnostics,
+			),
+		);
 	}
 
 	if (serverNames.length === 0) {
 		return undefined;
 	}
 
+	const incomplete = failedServers.length > 0 ? `Diagnostics unavailable from ${failedServers.join(", ")}` : undefined;
 	if (allDiagnostics.length === 0) {
 		return {
 			server: serverNames.join(", "),
-			messages: [],
-			summary: "OK",
+			messages: incomplete ? [incomplete] : [],
+			summary: incomplete ?? "OK",
 			errored: false,
 		};
 	}
@@ -521,7 +525,8 @@ export async function getDiagnosticsForFile(
 	sortDiagnostics(uniqueDiagnostics);
 	const formatted = uniqueDiagnostics.map(d => formatDiagnostic(d, relPath));
 	const limited = limitDiagnosticMessages(formatted);
-	const summary = formatDiagnosticsSummary(uniqueDiagnostics);
+	if (incomplete) limited.push(incomplete);
+	const summary = `${formatDiagnosticsSummary(uniqueDiagnostics)}${incomplete ? `; ${incomplete}` : ""}`;
 	const hasErrors = uniqueDiagnostics.some(d => d.severity === 1);
 
 	return {
