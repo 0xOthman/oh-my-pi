@@ -20,12 +20,14 @@ export interface LateDiagnosticsFile {
 	summary?: string;
 	errored?: boolean;
 	messages?: string[];
+	/** Incomplete-report warning carried apart from the diagnostic rows. */
+	unavailable?: string;
 }
 
 /** A tool frame (edit/write) that takes late diagnostics for its own paths. */
 interface LateDiagnosticsTarget {
 	attachLateDiagnostics(
-		files: readonly { path: string; summary: string; errored: boolean; messages: string[] }[],
+		files: readonly { path: string; summary: string; errored: boolean; messages: string[]; unavailable?: string }[],
 	): boolean;
 }
 
@@ -52,6 +54,7 @@ export function routeLateDiagnostics(
 					summary: file.summary ?? "",
 					errored: file.errored === true,
 					messages: file.messages ?? [],
+					unavailable: file.unavailable,
 				}
 			: undefined;
 		const routed =

@@ -419,7 +419,7 @@ type McpNotificationEntry = {
 };
 
 type LateDiagnosticsDetails = {
-	files: Array<{ path: string; summary: string; errored: boolean; messages: string[] }>;
+	files: Array<{ path: string; summary: string; errored: boolean; messages: string[]; unavailable?: string }>;
 };
 
 function buildLateDiagnosticsBatchMessage(
@@ -431,15 +431,9 @@ function buildLateDiagnosticsBatchMessage(
 		summary: entry.summary,
 		messages: entry.messages,
 		errored: entry.errored,
+		unavailable: entry.unavailable,
 	}));
-	const details: LateDiagnosticsDetails = {
-		files: files.map(file => ({
-			path: file.path,
-			summary: file.summary,
-			errored: file.errored,
-			messages: file.messages,
-		})),
-	};
+	const details: LateDiagnosticsDetails = { files };
 	return {
 		role: "custom",
 		customType: LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,

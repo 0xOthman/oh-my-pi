@@ -336,6 +336,8 @@ function diagnosticRow(diagnostic: ParsedDiagnostic, withPath: boolean, key: str
  * LSP diagnostics section for write/edit results: rows of severity icon ·
  * `line:col` · message, most severe first, capped at five with `+N more`.
  * Rows name the file too when the messages span several files (or `withPath`).
+ * An `unavailable` status renders after the capped rows so an incomplete report
+ * stays visible however many diagnostics precede it.
  * Undefined when there is nothing to show.
  */
 export function diagnosticsSection(
@@ -346,6 +348,7 @@ export function diagnosticsSection(
 	const parsed: ParsedDiagnostic[] = [];
 	const unparsed: string[] = [];
 	for (const message of diagnostics.messages) {
+		if (message === diagnostics.unavailable) continue;
 		const diagnostic = parseDiagnosticMessage(plainText(message).trim());
 		if (diagnostic) parsed.push(diagnostic);
 		else if (message.trim()) unparsed.push(plainText(message).trim());
@@ -364,6 +367,17 @@ export function diagnosticsSection(
 	const hidden = rows.length - shown.length;
 	if (hidden > 0) {
 		shown.push(text([span(`+${hidden} more`, "muted")], { role: "omp.tool.stats", key: "more" }));
+	}
+	if (diagnostics.unavailable) {
+		shown.push(
+			row(
+				[diagnosticGlyph("warning"), text([span(plainText(diagnostics.unavailable), "warning")], { wrap: "word" })],
+				{
+					role: "omp.tool.notice",
+					key: "unavailable",
+				},
+			),
+		);
 	}
 	return node(
 		"section",

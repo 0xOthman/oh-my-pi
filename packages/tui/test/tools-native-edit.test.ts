@@ -78,4 +78,21 @@ describe("edit native views", () => {
 		expect(collect(rows[0]!.c, "text").map(t => spanText(t, "spans"))).toEqual(["40:3", "Type mismatch ts 2322"]);
 		expect(spanText(children.at(-1)!, "spans")).toBe("+2 more");
 	});
+
+	it("keeps an unavailable-server warning visible past the diagnostic cap", () => {
+		const unavailable = "Diagnostics unavailable from tombi";
+		const messages = [...Array.from({ length: 6 }, (_, i) => `src/a.ts:${i + 1}:1 [error] broken ${i}`), unavailable];
+		const diagnostics: FileDiagnosticsResult = {
+			messages,
+			summary: `6 error(s); ${unavailable}`,
+			errored: true,
+			unavailable,
+		};
+		const children = (diagnosticsSection(diagnostics)?.c ?? []).filter(isNode);
+		expect(children.filter(child => prop(child, "role") === "omp.tool.diagnostic")).toHaveLength(5);
+		expect(spanText(children.at(-2)!, "spans")).toBe("+1 more");
+		const notice = children.at(-1)!;
+		expect(prop(notice, "role")).toBe("omp.tool.notice");
+		expect(collect(notice.c, "text").map(t => spanText(t, "spans"))).toEqual([unavailable]);
+	});
 });

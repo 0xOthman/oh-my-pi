@@ -49,6 +49,7 @@ export class DeferredDiagnostics {
 			summary: effective.summary ?? "",
 			messages: effective.messages ?? [],
 			errored: effective.errored,
+			unavailable: effective.unavailable,
 			isStale: () => this.#version(path) !== mutationVersion,
 		};
 		this.session.queueDeferredDiagnostics?.(entry);

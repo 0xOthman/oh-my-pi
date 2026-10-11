@@ -197,6 +197,8 @@ export interface DeferredDiagnosticsEntry {
 	messages: string[];
 	/** True when any message is error severity. */
 	errored: boolean;
+	/** Incomplete-report warning, rendered apart from capped diagnostic rows. */
+	unavailable?: string;
 	/**
 	 * Evaluated at injection time (in the dispatcher's stale check): drop the entry
 	 * when a newer mutation to the same file has superseded it, so the model never
