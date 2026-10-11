@@ -761,6 +761,38 @@ LATE_PROMPT_FAILURE_SERVER = textwrap.dedent(
     """
 )
 
+STALE_TERMINAL_SERVER = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    def emit(payload):
+        print(json.dumps(payload), flush=True)
+
+    emit({"type": "ready"})
+    for turn, raw_line in enumerate(sys.stdin, start=1):
+        command = json.loads(raw_line)
+        if command["type"] != "prompt":
+            raise RuntimeError("Unexpected fixture command")
+        emit({"type": "agent_start"})
+        if turn == 1:
+            emit({"type": "agent_end", "messages": []})
+        else:
+            emit({
+                "type": "message_start",
+                "message": {"role": "user", "content": "x" * 100, "timestamp": 1},
+            })
+            # No second terminal: the caller must not reuse the first one.
+        emit({
+            "type": "response",
+            "id": command["id"],
+            "command": "prompt",
+            "success": True,
+        })
+    """
+)
+
+
 STDERR_SERVER = textwrap.dedent(
     """
     import json
@@ -1506,6 +1538,17 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertIn("max_event_history", str(ctx.exception))
 
+    def test_oversized_event_never_replays_previous_turn_terminal(self) -> None:
+        with self.make_client(
+            server=STALE_TERMINAL_SERVER, max_event_bytes=60
+        ) as client:
+            first = client.prompt_and_wait("first", timeout=2.0)
+            self.assertEqual(
+                [event.type for event in first.events], ["agent_start", "agent_end"]
+            )
+            with self.assertRaisesRegex(RpcError, "Event history limit was exceeded"):
+                client.prompt_and_wait("second", timeout=0.2)
+
     def test_event_history_evicts_by_bytes(self) -> None:
         # A large count cap with a small byte budget must still bound memory:
         # the oldest frames are evicted from the front until within budget.
@@ -1520,17 +1563,20 @@ class RpcClientTests(unittest.TestCase):
         self.assertEqual(history.current_index(), 50)
 
     def test_event_history_drops_single_oversized_frame(self) -> None:
-        # A frame larger than the whole budget can never be retained; it is
-        # dropped rather than stored, but the index still advances so a waiter
-        # observes the gap instead of silently losing its place.
+        # A frame larger than the whole budget drops the retained prefix too:
+        # an old event cannot be reindexed after the gap.
         history: _BoundedHistory[str] = _BoundedHistory(
             limit=10, max_bytes=50, sizer=len
         )
         history.append("small")
+        start = history.current_index()
         history.append("y" * 100)
-        self.assertEqual(history.snapshot(), ("small",))
+        self.assertEqual(history.snapshot_from(start), ())
+        self.assertEqual(history.snapshot(), ())
         self.assertEqual(history.current_index(), 2)
-        self.assertEqual(history.total_bytes, len("small"))
+        self.assertEqual(history.total_bytes, 0)
+        history.append("new")
+        self.assertEqual(history.snapshot_from(start + 1), ("new",))
 
     def test_json_byte_size_tracks_wire_encoding(self) -> None:
         payload = {"type": "event", "text": "héllo"}

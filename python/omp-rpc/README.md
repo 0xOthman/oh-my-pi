@@ -249,11 +249,12 @@ with RpcClient(
 *how many bytes* they occupy. Because every streamed frame is cloned into the
 history, raising the event count alone can retain gigabytes when frames are
 large — the byte budget is what actually bounds memory. The oldest events are
-evicted from the front once either limit is exceeded, and a single frame larger
-than the whole byte budget is dropped rather than stored. Pass
-`max_event_bytes=None` to disable the byte budget (retention is then bounded by
-count only). The retained history is also cleared when the client stops, so a
-stopped client holds no events.
+evicted from the front once either limit is exceeded. A single frame larger
+than the whole byte budget is dropped along with previously retained events,
+preserving prompt boundaries; an active waiter raises a history-limit error
+rather than returning an earlier turn's events. Pass `max_event_bytes=None` to
+disable the byte budget (retention is then bounded by count only). The retained
+history is also cleared when the client stops, so a stopped client holds no events.
 
 If a single prompt streams more events than either limit allows,
 `prompt_and_wait()` raises a clear error so hosts can raise the limit instead of

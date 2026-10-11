@@ -414,8 +414,8 @@ class _BoundedHistory(Generic[THistoryItem]):
     `limit` caps the number of retained items. When `max_bytes` and `sizer` are
     both set, the history additionally evicts the oldest items until the summed
     item size is within `max_bytes`; a single item larger than the whole budget
-    is dropped without being stored. Every eviction advances `offset`, so a
-    consumer walking indices past a trimmed region observes the gap (e.g.
+    discards the retained prefix and itself. Retained items always have contiguous
+    indices, so consumers walking past a trimmed region observe the gap (e.g.
     `_wait_for_agent_end` raises instead of silently losing events).
     """
 
@@ -444,8 +444,9 @@ class _BoundedHistory(Generic[THistoryItem]):
         assert self.sizer is not None and self.max_bytes is not None
         size = self.sizer(item)
         if size > self.max_bytes:
-            # A single frame larger than the entire budget can never be held; drop
-            # it but advance the index so consumers see the gap.
+            # Discard the prefix as well: keeping it would assign old items
+            # indices after the dropped frame and replay prior turn events.
+            self._evict_front(len(self.items))
             self.offset += 1
             return
         self.items.append(item)
