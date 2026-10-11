@@ -113,8 +113,6 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 // eligible for preserved-turn continuation on resolved tool turns.
 const PREMATURE_STREAM_CLOSE_ERROR_RE =
 	/(?:stream closed before a (?:finish_reason|terminal response event)|Codex stream ended before terminal completion event|Cursor stream ended before turnEnded)/i;
-const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
-	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
 
 /**
  * Bare abort sentinels with no provider reason: our own `"Request was aborted"`
@@ -773,7 +771,9 @@ export class TurnRecovery {
 		if (message.stopReason !== "error") return false;
 		const id = this.#classifyRetryMessage(message);
 		const activeModel = this.#host.model();
-		if (!activeModel || !AIError.is(id, AIError.Flag.UsageLimit)) return false;
+		if (!activeModel || AIError.is(id, AIError.Flag.IntegrityRejected) || !AIError.is(id, AIError.Flag.UsageLimit)) {
+			return false;
+		}
 
 		let recorded = this.#usageLimitOutcomes.get(message);
 		if (!recorded) {
@@ -1384,17 +1384,19 @@ export class TurnRecovery {
 	 */
 	#classifyRetryMessage(message: AssistantMessage): number {
 		const activeModel = this.#host.model();
-		if (!activeModel || message.api === activeModel.api) {
-			return AIError.classifyMessage(message);
-		}
-
-		const id = AIError.classifyMessage({
-			api: activeModel.api,
-			errorId: message.errorId,
-			errorMessage: message.errorMessage,
-			errorStatus: message.errorStatus,
-		});
+		const id =
+			!activeModel || message.api === activeModel.api
+				? AIError.classifyMessage(message)
+				: AIError.classifyMessage({
+						api: activeModel.api,
+						errorId: message.errorId,
+						errorMessage: message.errorClassificationMessage ?? message.errorMessage,
+						errorStatus: message.errorStatus,
+					});
 		message.errorId = id;
+		if (message.stopReason === "error" && AIError.is(id, AIError.Flag.IntegrityRejected)) {
+			message.errorPhase = message.content.length === 0 ? "pre-output" : "after-output";
+		}
 		return id;
 	}
 
@@ -1487,16 +1489,8 @@ export class TurnRecovery {
 		if (message.stopReason !== "error") return false;
 		if (this.#isUsagePreflightBlocked(message)) return false;
 		if (AIError.isResponsesRequestBodyReadTimeout(message)) return false;
-		const model = this.#host.model();
-		const immutableAnthropicThinkingError =
-			model?.api === "anthropic-messages" &&
-			(message.errorStatus === 400 ||
-				message.errorId === 400 ||
-				message.errorMessage?.startsWith("400 ") === true) &&
-			IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN.test(message.errorMessage ?? "");
-		if (immutableAnthropicThinkingError) return false;
-
 		const id = this.#classifyRetryMessage(message);
+		if (AIError.is(id, AIError.Flag.IntegrityRejected)) return false;
 		// Context overflow is handled by compaction, not retry.
 		const contextWindow = this.#host.model()?.contextWindow ?? 0;
 		if (AIError.isContextOverflow(message, contextWindow)) return false;
@@ -2327,17 +2321,11 @@ export class TurnRecovery {
 		if (this.#isUsagePreflightBlocked(message)) return false;
 		const model = this.#host.model();
 		if (!model) return false;
-		const immutableAnthropicThinkingError =
-			model.api === "anthropic-messages" &&
-			(message.errorStatus === 400 ||
-				message.errorId === 400 ||
-				message.errorMessage?.startsWith("400 ") === true) &&
-			IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN.test(message.errorMessage ?? "");
-		if (immutableAnthropicThinkingError) return false;
+		const id = this.#classifyRetryMessage(message);
+		if (AIError.is(id, AIError.Flag.IntegrityRejected)) return false;
 		const retrySettings = cfgRetry.get(this.#host.settings);
 		if (!retrySettings.enabled || !retrySettings.modelFallback) return false;
 		if (this.isClassifierRefusal(message)) return false;
-		const id = this.#classifyRetryMessage(message);
 		if (AIError.is(id, AIError.Flag.Abort) || AIError.is(id, AIError.Flag.UserInterrupt)) return false;
 		if (!retryFallbackAdmits(retrySettings.fallbackOn, AIError.is(id, AIError.Flag.UsageLimit))) return false;
 		// Text-ambiguous overflows waive the veto; usage-backed do not — see AIError.isTextAmbiguousContextOverflow (#9235).
@@ -2488,6 +2476,7 @@ export class TurnRecovery {
 	async #applyRetryPolicy(message: AssistantMessage, options?: RetryPolicyOptions): Promise<boolean> {
 		const retrySettings = cfgRetry.get(this.#host.settings);
 		if (this.#host.abortInProgress() || this.#host.isDisposed()) return false;
+		if (AIError.is(this.#classifyRetryMessage(message), AIError.Flag.IntegrityRejected)) return false;
 		// The Fireworks Fast→base degrade is an intrinsic model-selection safety net,
 		// not a retry loop, so it runs even when the user disabled retries: it switches
 		// the model once and lets the base turn proceed.

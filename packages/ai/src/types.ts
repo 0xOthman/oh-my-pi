@@ -1300,6 +1300,8 @@ export interface AssistantMessage {
 	errorStatus?: number;
 	/** Structured machine-readable error classifier; see `utils/error-id.ts` for bit layout and helpers. */
 	errorId?: number;
+	/** Output boundary at which a signed-content integrity rejection became terminal. */
+	errorPhase?: "pre-output" | "after-output";
 	/**
 	 * Stable identifiers for request features the provider silently dropped
 	 * during this turn (e.g. `"priority"`). Set when a server-side rejection

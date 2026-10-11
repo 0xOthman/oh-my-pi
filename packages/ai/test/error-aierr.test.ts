@@ -88,6 +88,40 @@ describe("AIError.classify — structural provider errors", () => {
 		expect(AIError.retriable(id)).toBe(true);
 	});
 
+	it("classifies Anthropic signed-content 400s as terminal even with transport wording", async () => {
+		const response = new Response(
+			JSON.stringify({
+				type: "error",
+				error: { type: "invalid_request_error", message: "compaction_content_mismatch: unexpected EOF" },
+			}),
+			{ status: 400 },
+		);
+		const error = await AIError.AnthropicApiError.fromResponse(response);
+		const id = AIError.classify(error, "anthropic-messages");
+		expect(error.status).toBe(400);
+		expect(AIError.stringify(id)).toBe("integrity-rejected");
+		expect(AIError.retriable(id)).toBe(false);
+		const message = { api: "anthropic-messages" as const, errorStatus: 400, errorMessage: error.message };
+		expect(AIError.classifyMessage(message)).toBe(id);
+	});
+
+	it("limits signed-content classification to Anthropic 400s", () => {
+		for (const status of [429, 503]) {
+			const id = AIError.classify(
+				new AIError.ProviderHttpError("compaction_content_mismatch", status),
+				"anthropic-messages",
+			);
+			expect(AIError.is(id, AIError.Flag.IntegrityRejected)).toBe(false);
+			expect(AIError.retriable(id)).toBe(true);
+		}
+		expect(
+			AIError.is(
+				AIError.classify(new AIError.ProviderHttpError("compaction_content_mismatch", 400), "openai-responses"),
+				AIError.Flag.IntegrityRejected,
+			),
+		).toBe(false);
+	});
+
 	it("keeps a terminal 4xx that wraps a stream-truncation cause terminal", () => {
 		const err = new AIError.ProviderHttpError("Bad Request", 400, { cause: new Error("unexpected EOF") });
 		const id = AIError.classify(err);

@@ -3220,6 +3220,74 @@ describe("AgentSession retry fallback", () => {
 			expect(getLastAssistantMessage(session).stopReason).toBe(stop);
 		},
 	);
+	it.each([
+		{ suffix: "signed compaction content was modified", flags: [AIError.Flag.IntegrityRejected] },
+		{ suffix: "prompt is too long", flags: [AIError.Flag.IntegrityRejected, AIError.Flag.ContextOverflow] },
+		{
+			suffix: "signed compaction content was modified; quota exceeded",
+			flags: [AIError.Flag.IntegrityRejected, AIError.Flag.UsageLimit],
+		},
+	])("surfaces a signed-compaction integrity rejection ($suffix) without recovery", async ({ suffix, flags }) => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("anthropic", "claude-opus-4-1");
+		if (!primaryModel || !fallbackModel) throw new Error("Expected bundled Anthropic test models to exist");
+
+		const error = `400 invalid_request_error: compaction_content_mismatch: ${suffix}`;
+		const requestedModels: string[] = [];
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: model => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.id !== primaryModel.id) return recoveredTextStream(model, "Unexpected fallback");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: emptyUsage(),
+						stopReason: "error",
+						errorStatus: 400,
+						errorMessage: error,
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial: failure });
+					stream.push({ type: "error", reason: "error", error: failure });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"retry.fallbackChains": { "anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			}),
+			modelRegistry,
+		});
+		const markUsageLimit = vi.spyOn(modelRegistry.authStorage.limits, "markReached");
+		const { retryStartEvents } = trackRetryEvents(session);
+
+		await session.prompt("Continue signed compaction");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+		expect(retryStartEvents).toEqual([]);
+		expect(markUsageLimit).not.toHaveBeenCalled();
+		expect(getLastAssistantMessage(session)).toMatchObject({
+			stopReason: "error",
+			provider: primaryModel.provider,
+			model: primaryModel.id,
+			errorId: AIError.create(...flags),
+			errorPhase: "pre-output",
+			errorMessage: error,
+		});
+	});
+
 	it("surfaces immutable Anthropic thinking errors without retry fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("anthropic", "claude-opus-4-1");
@@ -3292,6 +3360,8 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe(primaryModel.id);
 		expect(getLastAssistantMessage(session)).toMatchObject({
 			stopReason: "error",
+			errorId: AIError.create(AIError.Flag.IntegrityRejected),
+			errorPhase: "pre-output",
 			errorMessage: immutableThinkingError,
 		});
 	});

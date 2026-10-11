@@ -51,6 +51,8 @@ export const Flag = {
 	 * status value, so no raw status id can set it.
 	 */
 	CacheControlUnsupported: 0x0000_0800,
+	/** HTTP 400 rejection of immutable signed Anthropic thinking or compaction content. */
+	IntegrityRejected: 0x0000_0400,
 	/** HTTP 413 byte/media rejection — token compaction cannot shrink bytes or media budgets (#9235). */
 	PayloadRejected: 0x8000_0000,
 } as const;
@@ -71,6 +73,7 @@ const KIND_MASK =
 	Flag.ContextOverflow |
 	Flag.AuthFailed |
 	Flag.PayloadRejected |
+	Flag.IntegrityRejected |
 	Flag.SilentAbort |
 	Flag.UserInterrupt |
 	Flag.Abort |
@@ -166,6 +169,9 @@ function matchesPayloadRejectionText(text: string): boolean {
 }
 
 const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall\b/i;
+const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
+	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
+const ANTHROPIC_COMPACTION_INTEGRITY_ERROR_PATTERN = /\bcompaction_content_mismatch\b/i;
 const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
 const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|stop)/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
@@ -443,6 +449,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.AccountPolicy, "account-policy"],
 	[Flag.ContextOverflow, "context-overflow"],
 	[Flag.PayloadRejected, "payload-rejected"],
+	[Flag.IntegrityRejected, "integrity-rejected"],
 	[Flag.AuthFailed, "auth-failed"],
 	[Flag.SilentAbort, "silent-abort"],
 	[Flag.UserInterrupt, "user-interrupt"],
@@ -450,6 +457,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 ];
 
 const STATUS_MESSAGE_PATTERNS = [
+	/^(\d{3})\s+(?=invalid_request_error\b|\{)/i,
 	/\bstatus(?:_code)?[:=]\s*(\d{3})\b/i,
 	/\bstatus\s+(\d{3})\b/i,
 	/\bHTTP\s+(\d{3})\b/i,
@@ -469,6 +477,7 @@ export function is(id: number | undefined, flag: Flag): boolean {
 
 export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolean }): boolean {
 	if (is(id, Flag.ContentBlocked)) return false;
+	if (is(id, Flag.IntegrityRejected)) return false;
 	if (is(id, Flag.PayloadRejected)) return false;
 	if (opts?.replayUnsafe) return false;
 	if (is(id, Flag.MalformedFunctionCall)) return true;
@@ -611,6 +620,14 @@ function classifyText(
 		if (EMPTY_RESPONSE_PATTERN.test(errorMessage)) kinds |= Flag.EmptyResponse | Flag.Transient;
 		if (isContentBlockedText(errorMessage)) kinds |= Flag.ContentBlocked;
 		const statusClean = errorStatus ? errorStatus : (status({ message: errorMessage }) ?? undefined);
+		if (
+			api === "anthropic-messages" &&
+			statusClean === 400 &&
+			(ANTHROPIC_COMPACTION_INTEGRITY_ERROR_PATTERN.test(errorMessage) ||
+				IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN.test(errorMessage))
+		) {
+			kinds |= Flag.IntegrityRejected;
+		}
 
 		if (
 			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
