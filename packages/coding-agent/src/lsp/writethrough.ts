@@ -201,6 +201,7 @@ function mergeDiagnostics(
 ): FileDiagnosticsResult | undefined {
 	const messages: string[] = [];
 	const servers = new Set<string>();
+	const unavailableWarnings = new Set<string>();
 	let hasResults = false;
 	let hasFormatter = false;
 	let formatted = false;
@@ -218,9 +219,11 @@ function mergeDiagnostics(
 				}
 			}
 		}
-		if (result.messages.length > 0) {
-			messages.push(...result.messages);
+		const diagnosticCount = result.messages.length - (result.unavailable ? 1 : 0);
+		for (let i = 0; i < diagnosticCount; i++) {
+			messages.push(result.messages[i]!);
 		}
+		if (result.unavailable) unavailableWarnings.add(result.unavailable);
 		if (result.formatter !== undefined) {
 			hasFormatter = true;
 			if (result.formatter === FileFormatResult.FORMATTED) {
@@ -246,6 +249,11 @@ function mergeDiagnostics(
 		errored = summaryInfo.errored;
 		limitedMessages = limitDiagnosticMessages(messages);
 	}
+	const unavailable = unavailableWarnings.size > 0 ? Array.from(unavailableWarnings).join("; ") : undefined;
+	if (unavailable) {
+		summary = summary === "no issues" || summary === "OK" ? unavailable : `${summary}; ${unavailable}`;
+		limitedMessages.push(unavailable);
+	}
 	// Priority: FAILED > FORMATTED > UNCHANGED > UNSUPPORTED
 	const formatter = hasFormatter
 		? hasFailed
@@ -262,6 +270,7 @@ function mergeDiagnostics(
 		messages: limitedMessages,
 		summary,
 		errored,
+		unavailable,
 		formatter,
 	};
 }
@@ -558,9 +567,10 @@ async function runLspWritethrough(
 	if (formatter !== undefined) {
 		diagnostics ??= {
 			server: servers.map(([name]) => name).join(", "),
-			messages: [],
+			messages: enableDiagnostics ? ["Diagnostics unavailable"] : [],
 			summary: enableDiagnostics ? "Diagnostics unavailable" : "OK",
 			errored: false,
+			unavailable: enableDiagnostics ? "Diagnostics unavailable" : undefined,
 		};
 		diagnostics.formatter = formatter;
 	}

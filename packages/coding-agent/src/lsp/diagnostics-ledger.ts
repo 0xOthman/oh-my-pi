@@ -15,7 +15,11 @@ export class DiagnosticsLedger {
 		const currentIdentities = new Set<string>();
 		const fresh: string[] = [];
 
-		for (const message of result.messages) {
+		// Availability is appended after diagnostics, but is not itself a diagnostic
+		// identity: each incomplete report must retain it even when errors repeat.
+		const diagnosticCount = result.messages.length - (result.unavailable ? 1 : 0);
+		for (let i = 0; i < diagnosticCount; i++) {
+			const message = result.messages[i]!;
 			const identity = diagnosticIdentity(message);
 			currentIdentities.add(identity);
 			if (!previous?.has(identity)) {
@@ -29,14 +33,21 @@ export class DiagnosticsLedger {
 			this.#seen.set(absPath, currentIdentities);
 		}
 
-		if (fresh.length === result.messages.length) {
+		if (fresh.length === diagnosticCount) {
 			return result;
 		}
 
+		const status = summarizeDiagnosticMessages(fresh);
+		if (result.unavailable) fresh.push(result.unavailable);
 		return {
 			...result,
 			messages: fresh,
-			...summarizeDiagnosticMessages(fresh),
+			summary: result.unavailable
+				? status.summary === "no issues"
+					? result.unavailable
+					: `${status.summary}; ${result.unavailable}`
+				: status.summary,
+			errored: status.errored,
 		};
 	}
 }

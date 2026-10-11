@@ -81,6 +81,8 @@ export interface FileDiagnosticsResult {
 	summary: string;
 	/** Whether there are any errors (severity 1) */
 	errored: boolean;
+	/** Availability warning kept independent of deduplicated diagnostic messages. */
+	unavailable?: string;
 	/** Whether the file was formatted */
 	formatter?: FileFormatResult;
 }

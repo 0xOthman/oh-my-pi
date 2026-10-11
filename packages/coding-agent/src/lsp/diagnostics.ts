@@ -507,6 +507,7 @@ export async function getDiagnosticsForFile(
 			server: serverNames.join(", "),
 			messages: incomplete ? [incomplete] : [],
 			summary: incomplete ?? "OK",
+			unavailable: incomplete,
 			errored: false,
 		};
 	}
@@ -534,6 +535,7 @@ export async function getDiagnosticsForFile(
 		messages: limited,
 		summary,
 		errored: hasErrors,
+		unavailable: incomplete,
 	};
 }
 

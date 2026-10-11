@@ -5,6 +5,7 @@ import { createLspWritethrough, LspTool } from "@oh-my-pi/pi-coding-agent/lsp";
 import { type FileDiagnosticsResult, FileFormatResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import * as lspClient from "@oh-my-pi/pi-coding-agent/lsp/client";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
+import { DiagnosticsLedger } from "@oh-my-pi/pi-coding-agent/lsp/diagnostics-ledger";
 import {
 	formatContent,
 	getDiagnosticsForFile,
@@ -602,23 +603,25 @@ describe("LSP diagnostics freshness", () => {
 		expect(result.diagnostics).toBeUndefined();
 	});
 
-	it("warns when a clean linter cannot verify a silent LSP server", async () => {
+	it("keeps incomplete write feedback visible after repeated deduplication", async () => {
 		const filePath = path.join(tempDir.path(), "broken.ts");
 		const client = createClient(tempDir.path(), TEST_SERVER);
 		installVirtualTime(new VirtualClock(Date.now()));
 		vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
 
-		const result = await getDiagnosticsForFile(
-			filePath,
-			tempDir.path(),
-			[
-				["test-lsp", TEST_SERVER],
-				["clean-linter", createFormatter(async (_filePath, content) => content)],
-			],
-			{ timeoutMs: 300 },
-		);
-		expect(result?.summary).toContain("Diagnostics unavailable from test-lsp");
-		expect(result?.messages).toContain("Diagnostics unavailable from test-lsp");
+		const servers: Array<[string, ServerConfig]> = [
+			["test-lsp", TEST_SERVER],
+			["clean-linter", createFormatter(async (_filePath, content) => content)],
+		];
+		const result = await getDiagnosticsForFile(filePath, tempDir.path(), servers, { timeoutMs: 300 });
+		if (!result) throw new Error("Missing mixed-server diagnostics");
+		const ledger = new DiagnosticsLedger();
+		ledger.reduce(filePath, result);
+		const repeated = await getDiagnosticsForFile(filePath, tempDir.path(), servers, { timeoutMs: 300 });
+		if (!repeated) throw new Error("Missing repeated diagnostics");
+		const feedback = ledger.reduce(filePath, repeated);
+		expect(feedback.summary).toContain("Diagnostics unavailable from test-lsp");
+		expect(feedback.messages).toContain("Diagnostics unavailable from test-lsp");
 	});
 
 	it("does not report OK when an explicit diagnostics request observes no publish", async () => {

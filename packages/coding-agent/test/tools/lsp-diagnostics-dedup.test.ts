@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import { DiagnosticsLedger, diagnosticIdentity } from "@oh-my-pi/pi-coding-agent/lsp/diagnostics-ledger";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { DeferredDiagnostics } from "@oh-my-pi/pi-coding-agent/lsp/deferred-diagnostics";
+import type { DeferredDiagnosticsEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const FILE_A = "/repo/src/a.ts";
 const FILE_B = "/repo/src/b.ts";
@@ -84,6 +87,52 @@ describe("DiagnosticsLedger", () => {
 		const reduced = ledger.reduce(FILE_B, makeDiagnostics([TYPE_ERROR]));
 
 		expect(reduced.messages).toEqual([TYPE_ERROR]);
+	});
+	it("retains an availability warning across repeated incomplete reports", () => {
+		const ledger = new DiagnosticsLedger();
+		const unavailable = "Diagnostics unavailable from tombi";
+		const report: FileDiagnosticsResult = {
+			server: "clean-linter",
+			messages: [TYPE_ERROR, unavailable],
+			summary: `1 error(s); ${unavailable}`,
+			errored: true,
+			unavailable,
+		};
+		ledger.reduce(FILE_A, report);
+
+		const second = ledger.reduce(FILE_A, report);
+		expect(second.summary).toBe(unavailable);
+		expect(second.messages).toEqual([unavailable]);
+		expect(second.errored).toBe(false);
+		// A verified clean report after recovery must clear the warning.
+		const recovered = ledger.reduce(FILE_A, makeDiagnostics([]));
+		expect(recovered.unavailable).toBeUndefined();
+	});
+
+	it("queues repeated deferred availability warnings instead of dropping them", () => {
+		const queued: DeferredDiagnosticsEntry[] = [];
+		const session: ToolSession = {
+			cwd: "/repo",
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated({ "lsp.diagnosticsDeduplicate": true }),
+			queueDeferredDiagnostics: entry => queued.push(entry),
+		};
+		const deferred = new DeferredDiagnostics(session);
+		const unavailable = "Diagnostics unavailable from tombi";
+		const report: FileDiagnosticsResult = {
+			messages: [unavailable],
+			summary: unavailable,
+			errored: false,
+			unavailable,
+		};
+		deferred.begin(FILE_A).onDeferredDiagnostics(report);
+		deferred.begin(FILE_A).onDeferredDiagnostics(report);
+
+		expect(queued).toHaveLength(2);
+		expect(queued[1]?.summary).toContain(unavailable);
+		expect(queued[1]?.messages).toContain(unavailable);
 	});
 });
 

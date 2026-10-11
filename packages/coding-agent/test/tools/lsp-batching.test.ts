@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { createLspWritethrough } from "@oh-my-pi/pi-coding-agent/lsp";
 import { FileFormatResult } from "@oh-my-pi/pi-tui/tools/lsp";
 import * as lspConfig from "@oh-my-pi/pi-coding-agent/lsp/config";
+import { DiagnosticsLedger } from "@oh-my-pi/pi-coding-agent/lsp/diagnostics-ledger";
 import type { LinterClient, ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import { addFileWriteFallback } from "@oh-my-pi/pi-coding-agent/tools/file-write-fallback";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -64,6 +65,45 @@ describe("createLspWritethrough batching", () => {
 		expect(loadConfigSpy).toHaveBeenCalledTimes(1);
 		expect(await Bun.file(fileA).text()).toBe("const a = 1;\n");
 		expect(await Bun.file(fileB).text()).toBe("const b = 2;\n");
+	});
+
+	it("preserves unavailable-server feedback across repeated batch writes", async () => {
+		const clean = createFormatter(async (_filePath, content) => content);
+		const unavailable: ServerConfig = {
+			command: "silent-linter",
+			fileTypes: ["ts"],
+			rootMarkers: [],
+			createClient: () =>
+				({
+					format: async (_filePath, content) => content,
+					lint: async () => {
+						throw new Error("Server unavailable");
+					},
+				}) satisfies LinterClient,
+		};
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([
+			["clean-linter", clean],
+			["silent-linter", unavailable],
+		]);
+		const ledger = new DiagnosticsLedger();
+		const writethrough = createLspWritethrough(tempDir.path(), {
+			enableFormat: false,
+			enableDiagnostics: true,
+			transformDiagnostics: (filePath, result) => ledger.reduce(filePath, result),
+		});
+		const filePath = path.join(tempDir.path(), "a.ts");
+		await writethrough(filePath, "const value = 1;\n", undefined, undefined, {
+			id: "first-incomplete",
+			flush: true,
+		});
+		const second = await writethrough(filePath, "const value = 2;\n", undefined, undefined, {
+			id: "second-incomplete",
+			flush: true,
+		});
+
+		expect(second.diagnostics?.summary).toContain("Diagnostics unavailable from silent-linter");
+		expect(second.diagnostics?.messages).toContain("Diagnostics unavailable from silent-linter");
 	});
 
 	it("preserves a newer external change made before the batch flush", async () => {
