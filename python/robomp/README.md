@@ -213,9 +213,9 @@ The integration test spawns a real `omp --mode rpc` against an
   `ROBOMP_SHUTDOWN_KILL_TIMEOUT_SECONDS` (5s); compose
   `stop_grace_period: 30s` covers both.
 - **Dispatcher health.** A failed queue claim is logged and retried after a
-  one-second pause without dropping queued events. `/readyz` returns 503 if
-  the dispatcher has stopped; `/healthz` only checks that the HTTP process is
-  responding.
+  one-second pause without dropping queued events. `/readyz` returns 503
+  until a queue claim succeeds again, or whenever the dispatcher stops;
+  `/healthz` only checks that the HTTP process is responding.
 
 - **Logs.** Structured JSON on stdout, rotated to
   `/data/logs/robomp.log.jsonl`.

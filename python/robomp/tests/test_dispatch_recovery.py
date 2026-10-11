@@ -48,6 +48,42 @@ def test_transient_claim_error_does_not_strand_webhooks(settings, monkeypatch) -
         assert client.get("/readyz").status_code == 200
 
 
+def test_persistent_claim_failure_is_unready_until_queue_recovers(settings, monkeypatch) -> None:
+    retried = Event()
+    restored = Event()
+    dispatched = Event()
+    real_claim = Database.claim_next_event
+    failures = 0
+
+    def unavailable_claim(self):
+        nonlocal failures
+        if not restored.is_set():
+            failures += 1
+            if failures >= 2:
+                retried.set()
+            raise sqlite3.OperationalError("database is locked")
+        return real_claim(self)
+
+    async def record_triage(**kwargs):
+        dispatched.set()
+
+    monkeypatch.setattr(Database, "claim_next_event", unavailable_claim)
+    monkeypatch.setattr(tasks, "triage_issue", record_triage)
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert retried.wait(3)
+        response = _post_issue_opened(client, delivery="locked-persistent", user="reporter", number=12)
+        assert response.status_code == 202
+        assert app.state.bag["db"].get_event("locked-persistent").state == "queued"
+        assert client.get("/readyz").status_code == 503
+        assert client.get("/healthz").status_code == 200
+
+        restored.set()
+        assert dispatched.wait(3)
+        assert client.get("/readyz").status_code == 200
+
+
 def test_readyz_rejects_stopped_dispatcher(settings) -> None:
     app = create_app(settings)
     with TestClient(app) as client:

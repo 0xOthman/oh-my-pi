@@ -39,6 +39,7 @@ class WorkerPool:
         self.sandbox = sandbox
         self.git_transport = git_transport
         self._workers: list[asyncio.Task[None]] = []
+        self._claim_healthy = False
         self._wakeup = asyncio.Event()
         self._stop = asyncio.Event()
         self._slot_pool: SlotPool | None
@@ -81,7 +82,7 @@ class WorkerPool:
 
     def is_ready(self) -> bool:
         """Report whether the dispatcher can still drain queued events."""
-        return bool(self._workers) and not self._stop.is_set() and not self._workers[0].done()
+        return bool(self._workers) and not self._stop.is_set() and not self._workers[0].done() and self._claim_healthy
 
     async def inflight_snapshot(self) -> list[str]:
         """Return a stable, sorted snapshot of currently in-flight issue keys."""
@@ -201,7 +202,9 @@ class WorkerPool:
         while not self._stop.is_set():
             try:
                 row = await self._claim_next_unique()
+                self._claim_healthy = True
             except Exception:
+                self._claim_healthy = False
                 log.exception("dispatch claim failed")
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=1.0)
