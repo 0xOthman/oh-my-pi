@@ -1142,6 +1142,8 @@ function isRetryableUpstreamError(
 	status: number | undefined,
 	message: string | undefined,
 ): boolean {
+	// A signed-content rejection replays identically on any credential, whatever quota wording rides along.
+	if (AIError.is(AIError.classify(error, model.api), AIError.Flag.IntegrityRejected)) return false;
 	if (AIError.isAuthRetryableError(error)) return true;
 	// 401 means the credential is bad; 403 is its valid-token twin (access
 	// denied by plan, model policy, or org restriction — a sibling account may

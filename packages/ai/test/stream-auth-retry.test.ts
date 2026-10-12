@@ -375,6 +375,36 @@ describe("streamSimple resolver auth retry", () => {
 		expect(eventTypes).toEqual(["start", "text_start", "text_delta", "text_end", "done"]);
 	});
 
+	it("never rotates credentials for a signed-content integrity 400 carrying quota wording", async () => {
+		const message =
+			"400 invalid_request_error: compaction_content_mismatch: signed content was modified; quota exceeded";
+		const integrityId = classify(new ProviderHttpError(message, 400), "anthropic-messages");
+		const keys: unknown[] = [];
+		registerCustomApi(
+			API,
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				pushKey(keys, options);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: assistant() });
+					stream.push({ type: "error", reason: "error", error: assistantError(message, 400, integrityId) });
+				});
+				return stream;
+			},
+			SOURCE_ID,
+		);
+
+		const stream = streamSimple(model(), context, {
+			apiKey: async ctx => (ctx.error === undefined ? "old-key" : "switch-key"),
+		});
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect((await stream.result()).errorMessage).toBe(message);
+		expect(keys).toEqual(["old-key"]);
+	});
+
 	it("retries on a 401 carried only via errorStatus", async () => {
 		const keys: unknown[] = [];
 		registerCustomApi(
