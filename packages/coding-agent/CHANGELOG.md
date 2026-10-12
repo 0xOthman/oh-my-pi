@@ -5,7 +5,6 @@
 ### Fixed
 
 - Fixed `read.renderMarkdown` having no effect on plain-file reads: inline read previews now render Markdown files as formatted Markdown instead of numbered source ([#15007](https://github.com/can1357/oh-my-pi/issues/15007)).
-- Fixed `lsp` `rename_file` reporting a plain move as a normal rename when no language server supports or answers `workspace/willRenameFiles`: the result now warns that references were not rewritten, and reports `0 reference edits` when a supporting server found none ([#15526](https://github.com/can1357/oh-my-pi/issues/15526)).
 
 ## [18.10.3] - 2026-10-12
 

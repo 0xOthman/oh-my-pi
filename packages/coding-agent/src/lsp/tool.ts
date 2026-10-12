@@ -165,18 +165,6 @@ function formatRenameStatError(error: unknown): string {
 	return `${replaceTabs(error.code)}${syscall}`;
 }
 
-/** Why rename_file got no willRenameFiles answer, for its plain-move warning. */
-function describeMissingRenameSupport(unsupported: string[], unreachable: string[]): string {
-	const reasons: string[] = [];
-	if (unsupported.length > 0) {
-		reasons.push(`${unsupported.join(", ")}: workspace/willRenameFiles unsupported`);
-	}
-	if (unreachable.length > 0) {
-		reasons.push(`${unreachable.join(", ")}: unreachable`);
-	}
-	return reasons.length > 0 ? reasons.join("; ") : "no configured server handles these files";
-}
-
 /**
  * LSP tool for language server protocol operations.
  */
@@ -599,10 +587,6 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// — moving the path without those edits leaves dangling references
 			// (issue #8380).
 			const hardFailures: string[] = [];
-			// Servers that could not answer willRenameFiles at all. When no relevant
-			// server answered, the rename is a plain move and must say so (issue #15526).
-			const unsupported: string[] = [];
-			const unreachable: string[] = [];
 
 			for (const [serverName, serverConfig] of servers) {
 				throwIfAborted(signal);
@@ -620,7 +604,6 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					// this is not a willRenameFiles failure.
 					const msg = err instanceof Error ? err.message : String(err);
 					serverNotes.push(`  ${serverName}: ${msg}`);
-					unreachable.push(serverName);
 					continue;
 				}
 				try {
@@ -639,11 +622,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						throw err;
 					}
 					// method-not-found means the server doesn't implement the request;
-					// it contributes no edits but does not block. Any other error is a
-					// genuine failure from a server that supports willRenameFiles.
-					if (isMethodNotFoundError(err)) {
-						unsupported.push(serverName);
-					} else {
+					// skip it silently. Any other error is a genuine failure from a
+					// server that supports willRenameFiles.
+					if (!isMethodNotFoundError(err)) {
 						const msg = err instanceof Error ? err.message : String(err);
 						serverNotes.push(`  ${serverName}: ${msg}`);
 						hardFailures.push(serverName);
@@ -656,18 +637,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const fileCountLabel = sourceStat.isDirectory()
 				? `${pairs.length} file${pairs.length !== 1 ? "s" : ""} under ${sourceLabel}`
 				: sourceLabel;
-			const respondingLabel = Array.from(respondingServers).join(", ");
-			const plainMoveWarning =
-				respondingServers.size === 0
-					? `  Warning: plain move — no language server provides reference edits for ${sourceLabel} (${describeMissingRenameSupport(unsupported, unreachable)}); update imports/references manually`
-					: undefined;
 
 			const shouldApply = apply !== false;
 			if (!shouldApply) {
 				const lines: string[] = [];
 				lines.push(`Rename preview: ${fileCountLabel} → ${destLabel}`);
 				if (perServerEdits.length === 0) {
-					lines.push(plainMoveWarning ?? `  0 reference edits (${respondingLabel})`);
+					lines.push("  No LSP edits would be applied");
 				} else {
 					for (const { serverName, edit } of perServerEdits) {
 						const edits = formatWorkspaceEdit(edit, this.session.cwd);
@@ -686,7 +662,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					content: [{ type: "text", text: lines.join("\n") }],
 					details: {
 						action,
-						serverName: respondingLabel,
+						serverName: Array.from(respondingServers).join(", "),
 						success: true,
 						request: params,
 					},
@@ -706,7 +682,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					content: [{ type: "text", text: lines.join("\n") }],
 					details: {
 						action,
-						serverName: respondingLabel,
+						serverName: Array.from(respondingServers).join(", "),
 						success: false,
 						request: params,
 					},
@@ -805,9 +781,6 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// reference file are left unchanged.
 			await applyEditsThenRename(referenceEdits, source, dest);
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);
-			if (referenceEdits.length === 0) {
-				summary.push(plainMoveWarning ?? `  0 reference edits (${respondingLabel})`);
-			}
 
 			for (const [serverName, serverConfig] of servers) {
 				try {
@@ -838,7 +811,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				content: [{ type: "text", text: `${header}\n${summary.join("\n")}` }],
 				details: {
 					action,
-					serverName: respondingLabel,
+					serverName: Array.from(respondingServers).join(", "),
 					success: true,
 					request: params,
 				},
