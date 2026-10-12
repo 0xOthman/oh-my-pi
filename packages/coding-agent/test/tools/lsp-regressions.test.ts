@@ -3081,7 +3081,7 @@ describe("lsp regressions", () => {
 		}
 	});
 
-	it("rename_file skips a server that replies method-not-found and still renames", async () => {
+	it("rename_file still moves when a server replies method-not-found but warns that references were not rewritten", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-rename-file-mnf-");
 		try {
 			const sourceFile = path.join(tempDir.path(), "src", "old.ts");
@@ -3131,10 +3131,92 @@ describe("lsp regressions", () => {
 				timeout: 5,
 			});
 
-			// Unsupported server does not block: the path still moves.
+			// Unsupported server does not block: the path still moves, but the
+			// result must disclose that no reference edits were computed (#15526).
 			expect(fs.existsSync(sourceFile)).toBe(false);
 			expect(fs.existsSync(destFile)).toBe(true);
 			expect(result.details).toMatchObject({ action: "rename_file", success: true });
+			const output = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(output).toContain("Warning: plain move");
+			expect(output).toContain("test-lsp: workspace/willRenameFiles unsupported");
+		} finally {
+			vi.restoreAllMocks();
+			tempDir.removeSync();
+		}
+	});
+
+	it.each([
+		{
+			label: "unreachable server warns of a plain move",
+			reach: false,
+			expected: "test-lsp: unreachable",
+			absent: "0 reference edits",
+		},
+		{
+			label: "supporting server with no edits reports 0 reference edits",
+			reach: true,
+			expected: "0 reference edits (test-lsp)",
+			absent: "Warning: plain move",
+		},
+	])("rename_file coverage disclosure: $label", async ({ reach, expected, absent }) => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-file-coverage-");
+		try {
+			const sourceFile = path.join(tempDir.path(), "src", "old.ts");
+			const destFile = path.join(tempDir.path(), "src", "new.ts");
+			await Bun.write(sourceFile, "export const value = 42;\n");
+
+			const server: ServerConfig = { command: "test-lsp", fileTypes: ["ts"], rootMarkers: [] };
+			const client: LspClient = {
+				name: "test-lsp",
+				cwd: tempDir.path(),
+				config: server,
+				proc: {
+					stdin: { write() {}, flush: async () => {} },
+				} as unknown as LspClient["proc"],
+				requestId: 0,
+				diagnostics: new Map(),
+				diagnosticsVersion: 0,
+				openFiles: new Map(),
+				pendingRequests: new Map(),
+				isReading: false,
+				status: "ready",
+				lastActivity: Date.now(),
+				writeQueue: Promise.resolve(),
+				activeProgressTokens: new Set(),
+				projectLoaded: Promise.resolve(),
+				resolveProjectLoaded: () => {},
+			};
+
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+				servers: { "test-lsp": server },
+				idleTimeoutMs: undefined,
+			});
+			const getClient = vi.spyOn(lspClient, "getOrCreateClient");
+			if (reach) getClient.mockResolvedValue(client);
+			else getClient.mockRejectedValue(new Error("spawn test-lsp ENOENT"));
+			vi.spyOn(lspClient, "sendRequest").mockResolvedValue(null);
+			vi.spyOn(lspClient, "sendNotification").mockResolvedValue();
+
+			const tool = new LspTool(makeLspSession(tempDir.path()));
+			for (const apply of [false, true]) {
+				const result = await tool.execute("rename-file-coverage", {
+					action: "rename_file",
+					file: sourceFile,
+					new_name: destFile,
+					apply,
+					timeout: 5,
+				});
+				const output = result.content
+					.filter(block => block.type === "text")
+					.map(block => block.text)
+					.join("\n");
+				expect(output).toContain(expected);
+				expect(output).not.toContain(absent);
+			}
+			expect(fs.existsSync(destFile)).toBe(true);
 		} finally {
 			vi.restoreAllMocks();
 			tempDir.removeSync();
