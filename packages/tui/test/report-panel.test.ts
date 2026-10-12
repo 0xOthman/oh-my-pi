@@ -5,7 +5,7 @@ import { ReportPanel } from "@oh-my-pi/pi-tui/overlays/report-panel";
 import { editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { COMPOSER_DEFAULTS, Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
-import { withoutTerminalMultiplexer } from "./terminal-multiplexer-environment";
+import { withoutTerminalMultiplexer } from "./helpers/terminal-multiplexer";
 import { VirtualRenderScheduler } from "./virtual-render-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -18,7 +18,7 @@ beforeAll(async () => {
 });
 
 /**
- * A long transcript, a report above a one-row editor, both transient chrome as
+ * A long transcript, a report above a one-row editor, both below-transcript chrome as
  * the interactive mode mounts them, the report capped to the rows the editor
  * leaves free.
  */
@@ -38,7 +38,7 @@ async function mountReport(bodyRows: number) {
 	const dock = new Container();
 	const editor = new Container();
 	editor.addChild(new Text("EDITOR", 0, 0));
-	composer.setRuntimeChildren([transcript, dock, editor], { transient: [editor, dock] });
+	composer.setRuntimeChildren([transcript, dock, editor]);
 	composer.start({ playWelcomeIntro: false });
 	await scheduler.settle(terminal);
 	const panel = new ReportPanel({
@@ -126,7 +126,7 @@ describe("ReportPanel in text mode", () => {
 		const dock = new Container();
 		const editor = new Container();
 		editor.addChild(new Text("EDITOR", 0, 0));
-		composer.setRuntimeChildren([transcript, dock, editor], { transient: [editor, dock] });
+		composer.setRuntimeChildren([transcript, dock, editor]);
 		composer.start({ playWelcomeIntro: false });
 		await scheduler.settle(terminal);
 		const editorRow = () => terminal.getViewport().findIndex(row => row.includes("EDITOR"));
@@ -158,7 +158,6 @@ describe("ReportPanel in text mode", () => {
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 		dock.clear();
-		composer.pinInputToBottom();
 		composer.ui.requestRender();
 		await scheduler.settle(terminal);
 

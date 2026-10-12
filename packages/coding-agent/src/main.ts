@@ -20,7 +20,7 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
-import { $env, isBunTestRuntime, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
+import { $env, isBunTestRuntime, isCompiledBinary, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
@@ -39,8 +39,9 @@ import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
+import { fetchBuild } from "./cli/build-service";
 import { applyStartupCwd } from "./cli/startup-cwd";
-import { getLatestRelease } from "./cli/update-cli";
+import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -113,6 +114,7 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
+import { forkIfMovedAway } from "./session/session-transfer";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
 	discoverSystemPromptOverride,
@@ -236,9 +238,16 @@ async function checkForNewVersion(currentVersion: string): Promise<string | unde
 		return;
 	}
 	try {
+		// Checkouts update through git and a manager (Tern) updates its omp itself:
+		// "run omp update" would be wrong advice for both.
+		if (isSourceCheckout() || (await managedInstallName(process.execPath))) return;
 		const channel = cfgUpdateChannel.get(settings);
-		const release = await getLatestRelease({ timeoutMs: 5_000, channel });
-		return Bun.semver.order(release.version, currentVersion) > 0 ? release.version : undefined;
+		// A compiled binary updates from the build service; naming the running
+		// version lets the service prepare the patch `omp update` will then use.
+		const { version } = isCompiledBinary()
+			? await fetchBuild({ channel }, { timeoutMs: 5_000, fromVersion: currentVersion })
+			: await getLatestRelease({ timeoutMs: 5_000, channel });
+		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
 	}
@@ -723,6 +732,10 @@ async function runInteractiveMode(
 			}
 		}
 
+		if (!resuming && joinLink === undefined) {
+			await mode.maybeAutoCreateWorktree();
+		}
+
 		// `omp join <link>`: dispatch through the same builtin path as a typed
 		// `/join` so collab guards and error rendering stay in one place.
 		if (joinLink !== undefined) {
@@ -749,7 +762,6 @@ async function runInteractiveMode(
 	}
 
 	if (startupGoal !== undefined) {
-		session.maybeStartTitleGeneration(startupGoal);
 		try {
 			await mode.startGoalAtStartup(startupGoal);
 		} catch (error: unknown) {
@@ -758,7 +770,6 @@ async function runInteractiveMode(
 	}
 
 	if (initialMessage !== undefined) {
-		session.maybeStartTitleGeneration(initialMessage);
 		try {
 			using _keepalive = new EventLoopKeepalive();
 			// `steer` covers the race where the user submits a prompt of their own
@@ -773,7 +784,6 @@ async function runInteractiveMode(
 	}
 
 	for (const message of initialMessages) {
-		session.maybeStartTitleGeneration(message);
 		try {
 			using _keepalive = new EventLoopKeepalive();
 			await session.prompt(message, { streamingBehavior: "steer" });
@@ -872,33 +882,37 @@ async function moveMissingCwdSessionIfNeeded(
 		return { status: "not-needed" };
 	}
 
-	const movePromptResult = await askToMoveSession(session);
-	if (movePromptResult === "unavailable") {
-		throw new SessionResolutionError(
-			`Session "${sessionArg}" belongs to a directory that no longer exists (${sourceCwd}); run interactively to move it into the current project.`,
-		);
+	// A removed worktree of this checkout's repository: its session belongs here, no question to ask.
+	if (!(await SessionManager.isFromRemovedWorktree(session, cwd, sessionDir))) {
+		const movePromptResult = await askToMoveSession(session);
+		if (movePromptResult === "unavailable") {
+			throw new SessionResolutionError(
+				`Session "${sessionArg}" belongs to a directory that no longer exists (${sourceCwd}); run interactively to move it into the current project.`,
+			);
+		}
+		if (movePromptResult === "declined") {
+			return { status: "declined" };
+		}
 	}
-	if (movePromptResult === "declined") {
-		return { status: "declined" };
-	}
+	return { status: "moved", manager: await openRelocatedSession(session, cwd, sessionDir) };
+}
 
-	// Open anchored at the (now-missing) recorded cwd: `open` otherwise falls back
-	// to the launch cwd, which would make the `moveTo` below a no-op whenever the
-	// move target equals the current project dir. moveTo never chdirs, so the
-	// stale cwd is only a relocation source, not a directory we enter.
-	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
+/** {@link SessionManager.openRelocated} into `cwd`, reporting a live-writer refusal as a CLI error. */
+async function openRelocatedSession(
+	session: SessionInfo,
+	cwd: string,
+	sessionDir: string | undefined,
+): Promise<SessionManager> {
 	try {
-		await manager.moveTo(cwd, sessionDir);
+		return await SessionManager.openRelocated(session.path, session.cwd, cwd, sessionDir);
 	} catch (err) {
 		if (!(err instanceof SessionMoveRefusedError)) throw err;
-		await manager.close();
 		// Its directory is gone, so it cannot be resumed in place either.
 		throw new SessionResolutionError(
 			err.message,
 			"Close the session in the other omp process, then resume it again.",
 		);
 	}
-	return { status: "moved", manager };
 }
 
 type ResumedProjectResult = { cwd: string; chdirFailed?: string };
@@ -1177,7 +1191,9 @@ export async function createSessionManager(
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
 			try {
-				return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+				return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, {
+					repairInterruptedTail: true,
+				});
 			} catch (err) {
 				if (err instanceof ForkSourceNotFoundError) {
 					throw new SessionResolutionError(err.message, SESSION_NOT_FOUND_HINT);
@@ -1190,7 +1206,9 @@ export async function createSessionManager(
 			throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
 		}
 		try {
-			return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, {
+				repairInterruptedTail: true,
+			});
 		} catch (err) {
 			if (err instanceof ForkSourceNotFoundError) {
 				throw new SessionResolutionError(`Session "${forkSource}" not found.`, SESSION_NOT_FOUND_HINT);
@@ -1211,14 +1229,17 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+			let manager: SessionManager;
 			try {
-				return await SessionManager.open(sessionArg, parsed.sessionDir, undefined, { throwIfMissing: true });
+				manager = await SessionManager.open(sessionArg, parsed.sessionDir, undefined, { throwIfMissing: true });
 			} catch (err) {
 				if (isEnoent(err) || isEnotdir(err)) {
 					throw new SessionResolutionError(`Session "${sessionArg}" not found.`, SESSION_NOT_FOUND_HINT);
 				}
 				throw err;
 			}
+			// A copy whose conversation moved to another machine continues as a fork.
+			return await forkIfMovedAway(manager, parsed.sessionDir);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
 		if (!match) {
@@ -1233,7 +1254,7 @@ export async function createSessionManager(
 				askToMoveSession,
 			);
 			if (moveResult.status === "moved") {
-				return moveResult.manager;
+				return await forkIfMovedAway(moveResult.manager, parsed.sessionDir);
 			}
 			if (moveResult.status === "declined") {
 				return undefined;
@@ -1248,16 +1269,16 @@ export async function createSessionManager(
 				askToMoveSession,
 			);
 			if (moveResult.status === "moved") {
-				return moveResult.manager;
+				return await forkIfMovedAway(moveResult.manager, parsed.sessionDir);
 			}
 			if (moveResult.status === "declined") {
 				return undefined;
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await forkIfMovedAway(await SessionManager.open(match.session.path, parsed.sessionDir), parsed.sessionDir);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await forkIfMovedAway(await SessionManager.continueRecent(cwd, parsed.sessionDir), parsed.sessionDir);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
@@ -1270,7 +1291,10 @@ export async function createSessionManager(
 	// overriding them with CLI defaults.
 	// An explicit startup goal starts fresh even when implicit auto-resume is configured.
 	if (parsed.goal === undefined && cfgAutoResume.get(activeSettings)) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await forkIfMovedAway(
+			await SessionManager.continueRecent(cwd, parsed.sessionDir),
+			parsed.sessionDir,
+		);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -2128,8 +2152,19 @@ export async function runRootCommand(
 				stopStartupWatchdog();
 				process.exit(0);
 			}
-			sessionManager = await SessionManager.open(selected.path);
+			try {
+				sessionManager = await forkIfMovedAway(
+					(await SessionManager.isFromRemovedWorktree(selected, cwd, parsedArgs.sessionDir))
+						? await openRelocatedSession(selected, cwd, parsedArgs.sessionDir)
+						: await SessionManager.open(selected.path),
+					parsedArgs.sessionDir,
+				);
+			} catch (error: unknown) {
+				if (error instanceof SessionResolutionError) exitForSessionResolutionError(error);
+				throw error;
+			}
 			const previousCwd = cwd;
+			// A relocated session's `selected.cwd` is the removed worktree: missing, so the launch cwd stays.
 			const recordedCwd = selected.cwd || sessionManager.getRecordedCwd() || sessionManager.getCwd();
 			const resumedProject = await switchToResumedProject(
 				recordedCwd,
@@ -2189,6 +2224,7 @@ export async function runRootCommand(
 		sessionOptions.allowSessionModelFallback = isInteractive;
 		sessionOptions.settingsApproval = isInteractive;
 		sessionOptions.tuiTranscript = isInteractive;
+		sessionOptions.autoTitle = isInteractive;
 		sessionOptions.settings = settingsInstance;
 		sessionOptions.onPrewalkWarning = warning => {
 			if (isInteractive) notifs.push({ kind: "warn", message: warning });
