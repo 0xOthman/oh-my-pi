@@ -593,7 +593,7 @@ impl Fs {
 	pub async fn read(&self, path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 		let path = path.as_ref();
 		match self.route(path)? {
-			Route::Native => std::fs::read(path),
+			Route::Native => native::read(path),
 			Route::Provider(provider) => self.guard(provider.read(path)).await,
 			Route::Mounted(file) => {
 				let file = mount_open_async(file, &read_options()).await?;
@@ -776,7 +776,7 @@ impl Fs {
 	pub async fn copy(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
 		let (from, to) = (from.as_ref(), to.as_ref());
 		match (self.route(from)?, self.route(to)?) {
-			(Route::Native, Route::Native) => std::fs::copy(from, to),
+			(Route::Native, Route::Native) => native::copy(from, to),
 			(Route::Mounted(_), _) | (_, Route::Mounted(_)) => {
 				let source = self.open(from).await?;
 				let target = self.create(to).await?;
@@ -1217,7 +1217,7 @@ impl BlockingFs {
 	pub fn read(&self, path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 		let path = path.as_ref();
 		match self.fs.route(path)? {
-			Route::Native => std::fs::read(path),
+			Route::Native => native::read(path),
 			Route::Provider(provider) => self.run(provider.read(path)),
 			Route::Mounted(file) => {
 				let mut contents = Vec::new();
@@ -1385,7 +1385,7 @@ impl BlockingFs {
 	pub fn copy(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
 		let (from, to) = (from.as_ref(), to.as_ref());
 		match (self.fs.route(from)?, self.fs.route(to)?) {
-			(Route::Native, Route::Native) => std::fs::copy(from, to),
+			(Route::Native, Route::Native) => native::copy(from, to),
 			(Route::Mounted(_), _) | (_, Route::Mounted(_)) => {
 				let source = self.open(from)?;
 				let target = self.create(to)?;

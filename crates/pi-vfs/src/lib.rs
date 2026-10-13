@@ -56,6 +56,7 @@ pub use error::{
 pub use file::{File, FileHandle};
 pub use fs::{BlockingFs, Fs};
 pub use metadata::Metadata;
+pub use native::held_by_sqlite;
 pub use options::{
 	CanonicalizeOptions, DirOptions, MissingHandling, OpenOptions, ResolveMode, TempOptions,
 };

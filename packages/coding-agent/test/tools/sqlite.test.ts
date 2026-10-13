@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { isHeldBySqlite } from "@oh-my-pi/pi-natives";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -267,6 +268,43 @@ describe("SQLite tool support", () => {
 		const result = await readTool.execute("sqlite-invalid-db", { path: invalidDbPath });
 		expect(getText(result)).toContain("not sqlite");
 	});
+
+	// Closing any descriptor on a live database drops this process's POSIX locks, after which peers
+	// treat the connection as gone and checkpoint/unlink its WAL (#15586). `/proc/locks` names the owner.
+	it.skipIf(process.platform !== "linux")(
+		"reads a database this process holds open without releasing its locks",
+		async () => {
+			const dbPath = path.join(tmpDir, "held.db");
+			const db = new Database(dbPath);
+			const heldLocks = async (): Promise<number> => {
+				const stats = await Promise.all([dbPath, `${dbPath}-shm`].map(file => fs.stat(file)));
+				const inodes = new Set(stats.map(stat => String(stat.ino)));
+				const table = await Bun.file("/proc/locks").text();
+				return table.split("\n").filter(line => {
+					const [, , , , pid, device] = line.trim().split(/\s+/);
+					return pid === String(process.pid) && inodes.has(device?.split(":")[2] ?? "");
+				}).length;
+			};
+			try {
+				db.run("PRAGMA journal_mode = WAL");
+				db.run("CREATE TABLE entries (value TEXT NOT NULL)");
+				db.run("INSERT INTO entries (value) VALUES ('live')");
+				// The native guard caches its descriptor scan on the native clock; poll until it sees `db`.
+				for (let attempt = 0; !isHeldBySqlite(dbPath); attempt++) {
+					if (attempt === 100) throw new Error("held.db never reported as held");
+					await Bun.sleep(10);
+				}
+				const before = await heldLocks();
+				expect(before).toBeGreaterThan(0);
+
+				expect(getText(await readTool.execute("sqlite-held", { path: dbPath }))).toContain("entries (1 rows)");
+				await expect(readTool.execute("sqlite-held-shm", { path: `${dbPath}-shm` })).rejects.toThrow(/holds open/);
+				expect(await heldLocks()).toBe(before);
+			} finally {
+				db.close();
+			}
+		},
+	);
 
 	it("shows table schema and sample rows", async () => {
 		const result = await readTool.execute("sqlite-schema", { path: `${sqlitePath}:users` });

@@ -509,3 +509,43 @@ fn descriptor_overlay_shares_the_pinned_file() {
 	assert!(fs.remove_file("/dev/fd/77").is_err());
 	assert!(path.exists());
 }
+
+/// Byte-level opens of a SQLite file this process holds would release the
+/// connection's POSIX locks when they close (#15586), so host opens refuse
+/// exactly those inodes: held database and WAL-index headers, not other held
+/// files nor SQLite files nobody holds.
+#[cfg(unix)]
+#[test]
+fn host_opens_refuse_sqlite_files_this_process_holds() {
+	// Outlives the guard's descriptor-scan cache.
+	const RESCAN: Duration = Duration::from_millis(250);
+	let dir = TempDir::new("held-sqlite");
+	let db = dir.0.join("agent.db");
+	let shm = dir.0.join("agent.db-shm");
+	let text = dir.0.join("notes.txt");
+	let idle = dir.0.join("idle.db");
+	let mut wal_index = 3_007_000_u32.to_ne_bytes().to_vec();
+	wal_index.resize(136, 0);
+	std::fs::write(&db, b"SQLite format 3\0rest of page").unwrap();
+	std::fs::write(&shm, &wal_index).unwrap();
+	std::fs::write(&text, b"needle").unwrap();
+	std::fs::write(&idle, b"SQLite format 3\0idle").unwrap();
+	let held = [&db, &shm, &text].map(|path| std::fs::File::open(path).unwrap());
+	std::thread::sleep(RESCAN);
+
+	let fs = BlockingFs::native();
+	for path in [&db, &shm] {
+		assert!(held_by_sqlite(path), "{} should be held", path.display());
+		assert_eq!(fs.open(path).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
+		assert_eq!(fs.read(path).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
+	}
+	assert_eq!(fs.copy(&db, dir.0.join("copy.db")).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
+	assert_eq!(fs.read(&text).unwrap(), b"needle");
+	assert!(!held_by_sqlite(&idle));
+	assert!(fs.read(&idle).is_ok());
+
+	drop(held);
+	std::thread::sleep(RESCAN);
+	assert!(!held_by_sqlite(&db));
+	assert!(fs.read(&db).is_ok());
+}

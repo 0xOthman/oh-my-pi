@@ -2310,6 +2310,15 @@ export interface IpcListenOptions {
   maxFrameBytes?: number
 }
 
+/**
+ * Whether `path` is a SQLite database or WAL index this process holds open.
+ *
+ * JS readers check this before a byte-level `Bun.file` read: closing any
+ * descriptor on such a file releases the POSIX locks of the process's own
+ * SQLite connection (native opens already refuse it).
+ */
+export declare function isHeldBySqlite(path: string): boolean
+
 /** Kind enum of the backend selected by default for this build target. */
 export declare function isoBackend(): IsoBackendKind
 

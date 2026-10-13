@@ -1,7 +1,7 @@
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
+import { type EditStore, isHeldBySqlite, notebookToEditableText } from "@oh-my-pi/pi-natives";
 import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
@@ -1946,6 +1946,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (specialKind) {
 			throw new ToolError(
 				`Cannot read '${localReadPath}': it is a ${specialKind}, not a regular file or directory.`,
+			);
+		}
+		// SQLite paths route to the query reader before here; any other byte read of a file this
+		// process's SQLite connection holds would release that connection's POSIX locks on close.
+		if (!isDirectory && isHeldBySqlite(absolutePath)) {
+			throw new ToolError(
+				`Cannot read '${localReadPath}': it is a SQLite file this process holds open; read the database through its .db path instead.`,
 			);
 		}
 		// Speculative reads open the authorized resolved target (absolutePath)

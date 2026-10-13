@@ -20,6 +20,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import {
+	isHeldBySqlite,
 	type ShellFilesystem,
 	ShellFsFileType,
 	type ShellFsMetadata,
@@ -312,7 +313,13 @@ export class InternalUrlFilesystem {
 	async readPrefix(input: string, maxBytes: number): Promise<Uint8Array> {
 		try {
 			const node = await this.#node(input, true, false);
-			if (node.kind !== "virtual") return await Bun.file(node.path).slice(0, maxBytes).bytes();
+			if (node.kind !== "virtual") {
+				// Closing this read's descriptor would release the POSIX locks of the process's own SQLite connection.
+				if (isHeldBySqlite(node.path)) {
+					throw new UrlFsError("EBUSY", `SQLite database held open by this process: ${node.path}`);
+				}
+				return await Bun.file(node.path).slice(0, maxBytes).bytes();
+			}
 			if (node.directory) throw new UrlFsError("EISDIR", `Is a directory: ${node.url}`);
 			return node.bytes.subarray(0, maxBytes);
 		} catch (error) {

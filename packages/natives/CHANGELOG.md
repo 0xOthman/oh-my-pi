@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `isHeldBySqlite(path)` reporting whether a path is a SQLite database or WAL index the current process holds open ([#15586](https://github.com/can1357/oh-my-pi/issues/15586)).
+
 ### Fixed
 
 - Fixed `pwsh` code blocks rendering without PowerShell syntax colors ([#15008](https://github.com/can1357/oh-my-pi/issues/15008)).
+- Fixed native host opens (`grep`, shell builtins, `read`/`copy`) releasing the process's own SQLite POSIX locks: they now fail with `EBUSY` on a database or `-shm` the process holds open ([#15586](https://github.com/can1357/oh-my-pi/issues/15586)).
 
 ## [18.10.2] - 2026-10-12
 

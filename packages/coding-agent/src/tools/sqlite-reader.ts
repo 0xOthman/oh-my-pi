@@ -1,4 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
+import { isHeldBySqlite } from "@oh-my-pi/pi-natives";
 import { formatBytes, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
@@ -19,6 +20,9 @@ function isSqliteCantOpen(error: unknown): boolean {
 }
 
 async function requiresWalSidecarInitialization(filePath: string): Promise<boolean> {
+	// A database this process holds open already has its sidecars, and reading its header outside
+	// SQLite would release the open connection's POSIX locks.
+	if (isHeldBySqlite(filePath)) return false;
 	const formatVersions = await Bun.file(filePath).slice(18, 20).bytes();
 	if (formatVersions[0] !== 2 && formatVersions[1] !== 2) return false;
 	const [walExists, shmExists] = await Promise.all([
@@ -554,7 +558,12 @@ export function parseSqlitePathCandidates(filePath: string): SqlitePathCandidate
 	return candidates.sort((left, right) => right.sqlitePath.length - left.sqlitePath.length);
 }
 
+/**
+ * Whether `absolutePath` is a SQLite database. A database this process already holds open answers
+ * without a byte read: closing that read's descriptor would release the connection's POSIX locks.
+ */
 export async function isSqliteFile(absolutePath: string): Promise<boolean> {
+	if (isHeldBySqlite(absolutePath)) return true;
 	try {
 		return looksLikeSqlite(await Bun.file(absolutePath).slice(0, SQLITE_MAGIC.byteLength).bytes());
 	} catch {

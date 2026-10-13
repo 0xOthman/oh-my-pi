@@ -129,3 +129,13 @@ pub fn invalidate_fs_scan_cache(path: Option<JsString>) -> Result<()> {
 	}
 	Ok(())
 }
+
+/// Whether `path` is a SQLite database or WAL index this process holds open.
+///
+/// JS readers check this before a byte-level `Bun.file` read: closing any
+/// descriptor on such a file releases the POSIX locks of the process's own
+/// SQLite connection (native opens already refuse it).
+#[napi]
+pub fn is_held_by_sqlite(path: String) -> bool {
+	pi_vfs::held_by_sqlite(Path::new(&path))
+}

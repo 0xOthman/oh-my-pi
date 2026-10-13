@@ -1,6 +1,7 @@
 //! Host filesystem operations. Everything here is synchronous: the facades
 //! call it directly, without futures or boxing.
 
+mod held_sqlite;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -13,6 +14,8 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+pub use self::held_sqlite::held_by_sqlite;
+use self::held_sqlite::refuse_held_sqlite;
 #[cfg(unix)]
 pub(crate) use self::unix::{
 	access, allocated_size, chown, close, file_id, file_id_of, file_is_locked, file_metadata,
@@ -37,7 +40,19 @@ use crate::{
 };
 
 pub(crate) fn open(path: &Path, options: &OpenOptions) -> io::Result<File> {
+	refuse_held_sqlite(path)?;
 	options.to_std().open(path).map(File::from)
+}
+
+pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
+	refuse_held_sqlite(path)?;
+	fs::read(path)
+}
+
+pub(crate) fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+	refuse_held_sqlite(from)?;
+	refuse_held_sqlite(to)?;
+	fs::copy(from, to)
 }
 
 // Windows path stats carry handle identity when the object can be opened for
