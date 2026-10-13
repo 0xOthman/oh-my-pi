@@ -5,17 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { grep, isHeldBySqlite } from "../native/index.js";
 
-/**
- * Waits until the native guard's descriptor scan sees the new connection. The scan is cached against the
- * native monotonic clock, which fake timers cannot advance, so this polls the real condition instead.
- */
-async function untilHeld(dbPath: string): Promise<void> {
-	for (let attempt = 0; !isHeldBySqlite(dbPath); attempt++) {
-		if (attempt === 100) throw new Error(`${dbPath} never reported as held`);
-		await Bun.sleep(10);
-	}
-}
-
 /** Opens and closes `dbPath` in a separate process; the last connection out checkpoints and unlinks the WAL. */
 function peerOpenClose(dbPath: string): void {
 	const script = `const { Database } = require("bun:sqlite"); const db = new Database(${JSON.stringify(dbPath)}); db.query("SELECT count(*) FROM t").get(); db.close();`;
@@ -36,7 +25,8 @@ describe.skipIf(process.platform === "win32")("SQLite files held by this process
 		db.run("PRAGMA journal_mode = WAL");
 		db.run("CREATE TABLE t (v TEXT)");
 		db.run("INSERT INTO t (v) VALUES ('needle')");
-		await untilHeld(dbPath);
+		// Checked right after the open: the guard reads the live descriptor table, so no wait is needed.
+		expect(isHeldBySqlite(dbPath)).toBe(true);
 	});
 
 	afterEach(async () => {

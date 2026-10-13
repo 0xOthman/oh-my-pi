@@ -513,12 +513,11 @@ fn descriptor_overlay_shares_the_pinned_file() {
 /// Byte-level opens of a SQLite file this process holds would release the
 /// connection's POSIX locks when they close (#15586), so host opens refuse
 /// exactly those inodes: held database and WAL-index headers, not other held
-/// files nor SQLite files nobody holds.
+/// files nor SQLite files nobody holds. The holders open right after another
+/// guarded open and are checked immediately: no scan result may go stale.
 #[cfg(unix)]
 #[test]
 fn host_opens_refuse_sqlite_files_this_process_holds() {
-	// Outlives the guard's descriptor-scan cache.
-	const RESCAN: Duration = Duration::from_millis(250);
 	let dir = TempDir::new("held-sqlite");
 	let db = dir.0.join("agent.db");
 	let shm = dir.0.join("agent.db-shm");
@@ -530,22 +529,58 @@ fn host_opens_refuse_sqlite_files_this_process_holds() {
 	std::fs::write(&shm, &wal_index).unwrap();
 	std::fs::write(&text, b"needle").unwrap();
 	std::fs::write(&idle, b"SQLite format 3\0idle").unwrap();
-	let held = [&db, &shm, &text].map(|path| std::fs::File::open(path).unwrap());
-	std::thread::sleep(RESCAN);
-
 	let fs = BlockingFs::native();
+	assert!(fs.read(&idle).is_ok());
+
+	let held = [&db, &shm, &text].map(|path| std::fs::File::open(path).unwrap());
+	let locks_on_db = lock_db(&held[0]);
 	for path in [&db, &shm] {
 		assert!(held_by_sqlite(path), "{} should be held", path.display());
+		// The first refusal sniffs the fresh descriptor and keeps it open;
+		// later ones are refused before opening.
 		assert_eq!(fs.open(path).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
 		assert_eq!(fs.read(path).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
 	}
+	assert_eq!(locks_on_db(), 1, "a refused open released the holder's lock");
+	assert_eq!(
+		fs.open_with(&db, OpenOptions::new().write(true))
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::ResourceBusy
+	);
 	assert_eq!(fs.copy(&db, dir.0.join("copy.db")).unwrap_err().kind(), io::ErrorKind::ResourceBusy);
 	assert_eq!(fs.read(&text).unwrap(), b"needle");
 	assert!(!held_by_sqlite(&idle));
 	assert!(fs.read(&idle).is_ok());
 
 	drop(held);
-	std::thread::sleep(RESCAN);
 	assert!(!held_by_sqlite(&db));
 	assert!(fs.read(&db).is_ok());
+	assert!(fs.read(&shm).is_ok());
+}
+
+/// Takes a POSIX read lock on `file` the way SQLite does and returns a probe
+/// counting this process's locks on that inode (`/proc/locks`; `1` elsewhere,
+/// where there is no such table to read).
+#[cfg(unix)]
+fn lock_db(file: &std::fs::File) -> impl Fn() -> usize + use<> {
+	use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+
+	// SAFETY: `flock` is a plain C struct; zero is valid before the fields
+	// below are set.
+	let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+	lock.l_type = libc::F_RDLCK as _;
+	lock.l_whence = libc::SEEK_SET as _;
+	// SAFETY: `file` owns a valid descriptor and `lock` is readable for
+	// F_SETLK.
+	assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &raw const lock) }, 0);
+	let inode = format!(":{} ", file.metadata().unwrap().ino());
+	let pid = format!(" {} ", std::process::id());
+	move || match std::fs::read_to_string("/proc/locks") {
+		Ok(table) => table
+			.lines()
+			.filter(|line| line.contains(&pid) && line.contains(&inode))
+			.count(),
+		Err(_) => 1,
+	}
 }

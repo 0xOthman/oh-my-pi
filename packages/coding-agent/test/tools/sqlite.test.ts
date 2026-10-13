@@ -289,11 +289,8 @@ describe("SQLite tool support", () => {
 				db.run("PRAGMA journal_mode = WAL");
 				db.run("CREATE TABLE entries (value TEXT NOT NULL)");
 				db.run("INSERT INTO entries (value) VALUES ('live')");
-				// The native guard caches its descriptor scan on the native clock; poll until it sees `db`.
-				for (let attempt = 0; !isHeldBySqlite(dbPath); attempt++) {
-					if (attempt === 100) throw new Error("held.db never reported as held");
-					await Bun.sleep(10);
-				}
+				// Checked right after the open: the guard reads the live descriptor table, so no wait is needed.
+				expect(isHeldBySqlite(dbPath)).toBe(true);
 				const before = await heldLocks();
 				expect(before).toBeGreaterThan(0);
 

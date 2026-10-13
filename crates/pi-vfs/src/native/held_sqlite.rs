@@ -8,71 +8,89 @@
 //! they are the last connection, checkpoint and unlink the WAL, and the
 //! orphaned connection later writes stale pages over the live file.
 //!
-//! [`held_by_sqlite`] recognizes those inodes before a descriptor exists, so
-//! host opens can refuse them. Windows locks are per handle, so it never
-//! matches there.
+//! Every check reads the descriptor table at the time of the call, so a
+//! connection opened a moment earlier is never missed:
+//! - [`held_by_sqlite`] answers by path before anything is opened (writes,
+//!   copies, JS readers).
+//! - Read-only [`open`]s sniff the new descriptor's header instead, which keeps
+//!   the per-file cost of a walk at one `fstat`+`pread`; a SQLite file another
+//!   descriptor in this process also holds is refused, and the new descriptor
+//!   is *kept open* rather than closed, since closing it is exactly what
+//!   releases the locks. Later opens of that inode are refused before any
+//!   descriptor exists, and the kept descriptors close once no other descriptor
+//!   holds the inode.
+//!
+//! Windows locks are per handle, so nothing is refused there.
 
-use std::{io, path::Path};
+use std::{fs, io, path::Path};
+
+use crate::options::OpenOptions;
 
 /// Whether `path` is a SQLite database or WAL index this process holds open.
 ///
 /// Only an open+close outside SQLite endangers such a file; opening it
 /// through SQLite is safe because SQLite defers its own closes while locks
 /// are held. Missing paths and non-regular files never match.
-#[cfg(unix)]
 pub fn held_by_sqlite(path: &Path) -> bool {
-	use std::os::unix::fs::MetadataExt;
-
-	let held = scan::held_inodes();
-	if held.is_empty() {
-		return false;
-	}
-	std::fs::metadata(path)
-		.is_ok_and(|meta| meta.is_file() && held.contains(&(meta.dev(), meta.ino())))
+	imp::held_by_sqlite(path)
 }
 
-/// Whether `path` is a SQLite database or WAL index this process holds open.
-#[cfg(not(unix))]
-pub fn held_by_sqlite(_path: &Path) -> bool {
-	false
-}
-
-/// Refuses `path` when opening it outside SQLite would release the locks of
-/// this process's own connection (see [`held_by_sqlite`]).
+/// Opens host `path` unless closing the result later would release the POSIX
+/// locks of this process's own SQLite connection (see [`held_by_sqlite`]).
 ///
 /// # Errors
-/// [`io::ErrorKind::ResourceBusy`] when `path` is held.
-pub(crate) fn refuse_held_sqlite(path: &Path) -> io::Result<()> {
-	if !held_by_sqlite(path) {
-		return Ok(());
+/// [`io::ErrorKind::ResourceBusy`] when `path` is a SQLite file this process
+/// holds open; otherwise whatever the host `open` reports.
+pub(crate) fn open(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
+	if options.is_writable() || options.is_truncate() {
+		// Header sniffing needs a readable descriptor and comes too late for a
+		// truncating open, so writers ask by path first.
+		if held_by_sqlite(path) {
+			return Err(busy());
+		}
+		return options.to_std().open(path);
 	}
-	Err(io::Error::new(
+	imp::open_for_reading(path, options)
+}
+
+pub(crate) fn busy() -> io::Error {
+	io::Error::new(
 		io::ErrorKind::ResourceBusy,
 		"SQLite database held open by this process; opening it outside SQLite would release the \
 		 connection's locks",
-	))
+	)
+}
+
+#[cfg(not(unix))]
+mod imp {
+	use std::{fs, io, path::Path};
+
+	use crate::options::OpenOptions;
+
+	pub(super) const fn held_by_sqlite(_path: &Path) -> bool {
+		false
+	}
+
+	pub(super) fn open_for_reading(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
+		options.to_std().open(path)
+	}
 }
 
 #[cfg(unix)]
-mod scan {
+mod imp {
 	use std::{
-		collections::HashSet,
-		fs,
+		fs, io,
 		mem::MaybeUninit,
-		sync::Arc,
-		time::{Duration, Instant},
+		os::{
+			fd::{AsRawFd, OwnedFd, RawFd},
+			unix::fs::{FileExt, MetadataExt},
+		},
+		path::Path,
 	};
 
 	use parking_lot::Mutex;
 
-	/// `(dev, ino)` of every held SQLite database and WAL index.
-	pub(super) type HeldInodes = Arc<HashSet<(u64, u64)>>;
-
-	/// How long one descriptor-table scan answers lookups. Walks open
-	/// thousands of files per second, and a scan costs an `fstat`+`pread` per
-	/// descriptor; SQLite only gains files when a connection opens, so a
-	/// connection younger than this window is the one case a lookup misses.
-	const SCAN_TTL: Duration = Duration::from_millis(100);
+	use crate::options::OpenOptions;
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	const FD_DIR: &str = "/proc/self/fd";
@@ -85,65 +103,120 @@ mod scan {
 	/// byte order.
 	const WAL_INDEX_VERSION: u32 = 3_007_000;
 
-	static LAST_SCAN: Mutex<Option<(Instant, HeldInodes)>> = Mutex::new(None);
+	/// `(dev, ino)` of a host file.
+	type Inode = (u64, u64);
 
-	pub(super) fn held_inodes() -> HeldInodes {
-		let mut last = LAST_SCAN.lock();
-		if let Some((at, held)) = last.as_ref()
-			&& at.elapsed() < SCAN_TTL
-		{
-			return Arc::clone(held);
+	/// Descriptors a read open found on a held SQLite inode and kept instead
+	/// of closing, keyed by that inode. Only the first open of each held inode
+	/// lands here; later ones are refused by path.
+	static KEPT: Mutex<Vec<(Inode, OwnedFd)>> = Mutex::new(Vec::new());
+
+	pub(super) fn held_by_sqlite(path: &Path) -> bool {
+		let Ok(meta) = fs::metadata(path) else {
+			return false;
+		};
+		if !meta.is_file() {
+			return false;
 		}
-		let held = Arc::new(scan());
-		*last = Some((Instant::now(), Arc::clone(&held)));
-		held
+		let kept = kept_fds(&KEPT.lock());
+		holders((meta.dev(), meta.ino()), &kept)
+			.into_iter()
+			.any(fd_has_sqlite_header)
 	}
 
-	/// Classifies every open regular-file descriptor by its header, read
-	/// through the existing descriptor: opening the file again would release
-	/// the very locks this guards.
-	fn scan() -> HashSet<(u64, u64)> {
-		let mut held = HashSet::new();
-		let Ok(entries) = fs::read_dir(FD_DIR) else {
-			return held;
-		};
-		for entry in entries.flatten() {
-			let Some(fd) = entry
-				.file_name()
-				.to_str()
-				.and_then(|name| name.parse::<libc::c_int>().ok())
-			else {
-				continue;
-			};
-			let mut stat = MaybeUninit::<libc::stat>::uninit();
-			// SAFETY: `stat` is writable for one `struct stat`. A descriptor
-			// closed or reused since the listing only fails or describes
-			// another file.
-			if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-				continue;
-			}
-			// SAFETY: `fstat` succeeded, so it initialized `stat`.
-			let stat = unsafe { stat.assume_init() };
-			if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-				continue;
-			}
-			let mut header = [0u8; 16];
-			// SAFETY: `header` is writable for its full length; `pread` leaves
-			// the descriptor's offset untouched, so its owner is unaffected.
-			let read = unsafe { libc::pread(fd, header.as_mut_ptr().cast(), header.len(), 0) };
-			let Ok(read) = usize::try_from(read) else {
-				continue;
-			};
-			if is_sqlite_header(&header[..read]) {
-				#[allow(
-					clippy::unnecessary_cast,
-					reason = "same widening as `MetadataExt::{dev, ino}`; `dev_t`/`ino_t` are narrower \
-					          or signed on some unix targets"
-				)]
-				held.insert((stat.st_dev as u64, stat.st_ino as u64));
-			}
+	pub(super) fn open_for_reading(path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
+		if refuses_kept_inode(path) {
+			return Err(super::busy());
 		}
-		held
+		let file = options.to_std().open(path)?;
+		let Some(inode) = sqlite_inode(&file) else {
+			return Ok(file);
+		};
+		let mut kept = KEPT.lock();
+		let mut ignored = kept_fds(&kept);
+		ignored.push(file.as_raw_fd());
+		if holders(inode, &ignored).is_empty() {
+			return Ok(file);
+		}
+		kept.push((inode, OwnedFd::from(file)));
+		Err(super::busy())
+	}
+
+	/// Refuses `path` while it names an inode with kept descriptors and
+	/// another descriptor still holds it; once none does, the kept descriptors
+	/// close (no locks left to release) and the open proceeds.
+	fn refuses_kept_inode(path: &Path) -> bool {
+		let mut kept = KEPT.lock();
+		if kept.is_empty() {
+			return false;
+		}
+		let Ok(meta) = fs::metadata(path) else {
+			return false;
+		};
+		let inode = (meta.dev(), meta.ino());
+		if !kept.iter().any(|(kept_inode, _)| *kept_inode == inode) {
+			return false;
+		}
+		if !holders(inode, &kept_fds(&kept)).is_empty() {
+			return true;
+		}
+		kept.retain(|(kept_inode, _)| *kept_inode != inode);
+		false
+	}
+
+	fn kept_fds(kept: &[(Inode, OwnedFd)]) -> Vec<RawFd> {
+		kept.iter().map(|(_, fd)| fd.as_raw_fd()).collect()
+	}
+
+	/// `(dev, ino)` of `file` when it is a regular file with a SQLite header.
+	fn sqlite_inode(file: &fs::File) -> Option<Inode> {
+		let meta = file.metadata().ok()?;
+		if !meta.is_file() {
+			return None;
+		}
+		let mut header = [0u8; 16];
+		let read = file.read_at(&mut header, 0).ok()?;
+		is_sqlite_header(&header[..read]).then(|| (meta.dev(), meta.ino()))
+	}
+
+	/// Open descriptors of this process on `inode`, other than `ignored`.
+	fn holders(inode: Inode, ignored: &[RawFd]) -> Vec<RawFd> {
+		let Ok(entries) = fs::read_dir(FD_DIR) else {
+			return Vec::new();
+		};
+		entries
+			.flatten()
+			.filter_map(|entry| entry.file_name().to_str()?.parse::<RawFd>().ok())
+			.filter(|fd| !ignored.contains(fd) && fd_inode(*fd) == Some(inode))
+			.collect()
+	}
+
+	fn fd_inode(fd: RawFd) -> Option<Inode> {
+		let mut stat = MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `stat` is writable for one `struct stat`. A descriptor closed
+		// or reused since the listing only fails or describes another file.
+		if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+			return None;
+		}
+		// SAFETY: `fstat` succeeded, so it initialized `stat`.
+		let stat = unsafe { stat.assume_init() };
+		#[allow(
+			clippy::unnecessary_cast,
+			reason = "same widening as `MetadataExt::{dev, ino}`; `dev_t`/`ino_t` are narrower or \
+			          signed on some unix targets"
+		)]
+		(stat.st_mode & libc::S_IFMT == libc::S_IFREG)
+			.then_some((stat.st_dev as u64, stat.st_ino as u64))
+	}
+
+	/// Whether `fd`'s file starts with a SQLite header, read without moving
+	/// the descriptor's offset.
+	fn fd_has_sqlite_header(fd: RawFd) -> bool {
+		let mut header = [0u8; 16];
+		// SAFETY: `header` is writable for its full length; `pread` leaves the
+		// descriptor's offset untouched, so its owner is unaffected.
+		let read = unsafe { libc::pread(fd, header.as_mut_ptr().cast(), header.len(), 0) };
+		usize::try_from(read).is_ok_and(|read| is_sqlite_header(&header[..read]))
 	}
 
 	fn is_sqlite_header(header: &[u8]) -> bool {

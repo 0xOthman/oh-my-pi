@@ -10,12 +10,11 @@ mod windows;
 use std::{
 	fs,
 	future::{Future, ready},
-	io,
+	io::{self, Read},
 	path::{Path, PathBuf},
 };
 
 pub use self::held_sqlite::held_by_sqlite;
-use self::held_sqlite::refuse_held_sqlite;
 #[cfg(unix)]
 pub(crate) use self::unix::{
 	access, allocated_size, chown, close, file_id, file_id_of, file_is_locked, file_metadata,
@@ -40,18 +39,21 @@ use crate::{
 };
 
 pub(crate) fn open(path: &Path, options: &OpenOptions) -> io::Result<File> {
-	refuse_held_sqlite(path)?;
-	options.to_std().open(path).map(File::from)
+	held_sqlite::open(path, options).map(File::from)
 }
 
 pub(crate) fn read(path: &Path) -> io::Result<Vec<u8>> {
-	refuse_held_sqlite(path)?;
-	fs::read(path)
+	let mut options = OpenOptions::new();
+	options.read(true);
+	let mut contents = Vec::new();
+	held_sqlite::open(path, &options)?.read_to_end(&mut contents)?;
+	Ok(contents)
 }
 
 pub(crate) fn copy(from: &Path, to: &Path) -> io::Result<u64> {
-	refuse_held_sqlite(from)?;
-	refuse_held_sqlite(to)?;
+	if held_by_sqlite(from) || held_by_sqlite(to) {
+		return Err(held_sqlite::busy());
+	}
 	fs::copy(from, to)
 }
 
