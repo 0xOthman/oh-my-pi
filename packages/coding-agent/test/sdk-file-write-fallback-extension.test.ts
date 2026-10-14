@@ -218,14 +218,18 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 				const headerLine = resultText(writeResult).split("\n")[0] ?? "";
 				expect(HASHLINE_HEADER_LINE.test(headerLine)).toBe(true);
 
-				// (iii) a subsequent hashline edit on the SAME real path works — this only
-				// holds if the write tool recorded its snapshot under `targetPath` itself
-				// (not a temp path the fallback happened to route through).
+				// (iii) a subsequent hashline edit on the SAME real path works after
+				// its anchor is revealed. The rejection requires the write snapshot
+				// to be recorded under `targetPath`, not a temporary broker path.
 				const editTool = session.getToolByName("edit") as AgentTool | undefined;
 				expect(editTool).toBeDefined();
 				const editInput = `${headerLine}\nPUT 1-1:\n+export const value = 43;\n`;
-				const editResult = await editTool!.execute("call-edit-1", { input: editInput });
+				const rejected = await editTool!.execute("call-edit-1", { input: editInput });
+				expect(rejected.isError).toBe(true);
+				expect(resultText(rejected)).toContain("1:export const value = 42;");
+				expect(fs.readFileSync(targetPath, "utf8")).toBe(content);
 
+				const editResult = await editTool!.execute("call-edit-2", { input: editInput });
 				expect(editResult.isError).not.toBe(true);
 				expect(fs.readFileSync(targetPath, "utf8")).toBe("export const value = 43;\n");
 			} finally {

@@ -346,6 +346,10 @@ fn rescue_shifted_anchors(
 	Ok(rescued)
 }
 
+/// Reject anchors the tagged snapshot never displayed, revealing their content
+/// inline. `None` provenance (tag issued without a display record) skips the
+/// guard; an empty set (a `write` tag) means no line was displayed, so every
+/// anchor is unseen.
 fn assert_seen_lines(
 	section: &PatchSection,
 	expected: &str,
@@ -359,9 +363,6 @@ fn assert_seen_lines(
 	let Some(seen) = snapshot.seen_lines else {
 		return Ok(());
 	};
-	if seen.is_empty() {
-		return Ok(());
-	}
 	let mut unseen = section
 		.collect_anchor_lines()?
 		.into_iter()

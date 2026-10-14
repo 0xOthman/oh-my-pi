@@ -13,6 +13,10 @@
 
 - Background task guidance now lives in the Task tool description (and in same-name extension replacements that delegate to Task) instead of being repeated in every spawn acknowledgment ([#15477](https://github.com/can1357/oh-my-pi/pull/15477) by [@iliaal](https://github.com/iliaal))
 
+### Fixed
+
+- Line-anchored edits against the tag a `write` returns are now rejected with the anchor lines revealed instead of applying at guessed line numbers ([#15666](https://github.com/can1357/oh-my-pi/issues/15666))
+
 ## [18.10.4] - 2026-10-13
 
 ### Added

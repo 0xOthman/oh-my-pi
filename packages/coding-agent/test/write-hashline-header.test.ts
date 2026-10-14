@@ -70,7 +70,7 @@ describe("write tool hashline header", () => {
 		expect(snapshot).toBe(content);
 	});
 
-	it("makes the post-write tag usable by the hashline patcher", async () => {
+	it("guards line-anchored edits on the post-write tag until the anchor is revealed", async () => {
 		const filePath = path.join(tmpDir, "config.ts");
 		const session = createSession(tmpDir);
 		const tool = new WriteTool(session);
@@ -80,13 +80,18 @@ describe("write tool hashline header", () => {
 		const headerLine = resultText(writeResult).split("\n")[0] ?? "";
 		expect(HASHLINE_HEADER_LINE.test(headerLine)).toBe(true);
 
-		// Apply a hashline patch immediately, using only the tag the write tool
-		// returned — no intervening `read`.
+		// A write displays no numbered lines: anchoring on its tag without a
+		// `read` is rejected with the anchor revealed, and the file is untouched.
 		const patchInput = `${headerLine}\nPUT 1-1:\n+export const enabled = true;\n`;
-		await new EditTool(session, "hashline").execute("call-2", { input: patchInput });
+		const edit = new EditTool(session, "hashline");
+		const rejected = resultText(await edit.execute("call-2", { input: patchInput }));
+		expect(rejected).toContain("never displayed");
+		expect(rejected).toContain("1:export const enabled = false;");
+		expect(await fs.readFile(filePath, "utf8")).toBe(content);
 
-		const final = await fs.readFile(filePath, "utf8");
-		expect(final).toBe("export const enabled = true;\n");
+		// The reveal counts as having seen the line, so the same patch now applies.
+		await edit.execute("call-3", { input: patchInput });
+		expect(await fs.readFile(filePath, "utf8")).toBe("export const enabled = true;\n");
 	});
 
 	it("names a local:// write by its URL, and the header round-trips through edit and write", async () => {
@@ -100,9 +105,9 @@ describe("write tool hashline header", () => {
 		expect(writeLine).toBe(`Successfully wrote ${content.length} bytes to local://notes.ts`);
 
 		await new EditTool(session, "hashline").execute("call-2", {
-			input: `${headerLine}\nPUT 1-1:\n+export const enabled = true;\n`,
+			input: `${headerLine}\nPUT >$:\n+export const flag = true;\n`,
 		});
-		expect(await fs.readFile(backingPath, "utf8")).toBe("export const enabled = true;\n");
+		expect(await fs.readFile(backingPath, "utf8")).toBe(`${content}export const flag = true;\n`);
 
 		// The URL-form header also addresses the same file as a `write` path.
 		await new WriteTool(session).execute("call-3", { path: headerLine, content: "export const v = 2;\n" });
