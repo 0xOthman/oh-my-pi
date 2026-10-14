@@ -10,7 +10,7 @@ import type { StatusLineComponent } from "../src/status-line/component";
 import { describeSegment, type SegmentContext } from "../src/status-line/segments";
 import { createStartupStatusLine } from "../src/status-line/startup";
 import type { StatusLineSettings } from "../src/status-line/types";
-import { initTheme } from "../src/theme";
+import { initTheme, theme } from "../src/theme";
 
 beforeAll(async () => {
 	await initTheme();
@@ -46,6 +46,36 @@ function facts(line: StatusLineComponent): { key: string; props: TspProps<"seg">
 			child.k === "seg" && child.key !== undefined ? [{ key: child.key, props: child.p ?? {} }] : [],
 		);
 }
+
+describe("extension status separators", () => {
+	it("dims only the theme-defined separator between accent-colored statuses", () => {
+		const line = statusLine({
+			preset: "custom",
+			leftSegments: ["status"],
+			rightSegments: [],
+			separator: "slash",
+			sessionAccent: false,
+		});
+		line.setHookStatus("a", "A !");
+		line.setHookStatus("empty", "");
+		line.setHookStatus("b", "B ?");
+		const dot = theme.sep.dot;
+
+		expect(line.renderBottomBar(120, "full")).toContain(
+			theme.fg("accent", "A !") + theme.fg("dim", dot) + theme.fg("accent", "B ?"),
+		);
+		const bar = line
+			.describePreview()
+			.c?.filter(isNode)
+			.find(child => child.k === "status");
+		const segment = bar?.c?.filter(isNode).find(child => child.k === "seg" && child.key === "status");
+		expect(segment?.k === "seg" ? segment.p?.spans : undefined).toEqual([
+			{ t: "A !", s: "accent" },
+			{ t: dot, s: "dim" },
+			{ t: "B ?", s: "accent" },
+		]);
+	});
+});
 
 describe("native composer facts", () => {
 	it("keeps the configured segments without another home, outer edges dropping last", () => {

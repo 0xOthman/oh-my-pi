@@ -250,25 +250,24 @@ function brandTimer(elapsedMs: number): string {
 const statusSegment: StatusLineSegment = {
 	id: "status",
 	render(ctx) {
-		let text = "";
+		let content = "";
 		for (const status of ctx.hookStatuses ?? []) {
 			const sanitized = sanitizeStatusText(status);
 			if (!sanitized) continue;
-			text += text ? `${theme.sep.dot}${sanitized}` : sanitized;
+			if (content) content += theme.fg("dim", theme.sep.dot);
+			content += accentFg(ctx, "accent", sanitized);
 		}
-		return {
-			content: text ? accentFg(ctx, "accent", text) : "",
-			visible: text.length > 0,
-		};
+		return { content, visible: content.length > 0 };
 	},
 	describe(ctx) {
-		let text = "";
+		const spans: TspSpan[] = [];
 		for (const status of ctx.hookStatuses ?? []) {
 			const sanitized = sanitizeStatusText(status);
 			if (!sanitized) continue;
-			text += text ? `${theme.sep.dot}${sanitized}` : sanitized;
+			if (spans.length > 0) spans.push(span(theme.sep.dot, "dim"));
+			spans.push(span(sanitized, accentToken(ctx, "accent")));
 		}
-		return text ? segView([span(text, accentToken(ctx, "accent"))]) : null;
+		return spans.length > 0 ? segView(spans) : null;
 	},
 };
 
