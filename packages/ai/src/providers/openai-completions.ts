@@ -259,26 +259,32 @@ function getLiteLLMThinkingBlocksDelta(delta: object): unknown[] | undefined {
 }
 
 /**
- * Rebuilds LiteLLM `thinking_blocks` from a stored assistant turn. Thinking
- * blocks parsed from `thinking_blocks` keep the raw Anthropic signature as
- * `thinkingSignature`; blocks parsed from `reasoning_content`-style fields
- * carry the field name instead and are skipped. `transformMessages` strips
- * signatures and redacted blocks on cross-model replays, so only the issuing
- * model ever receives them back.
+ * Whether a thinking block's `thinkingSignature` is a raw LiteLLM (Anthropic)
+ * signature. Blocks parsed from `reasoning_content`-style fields store the
+ * field name there instead.
+ */
+export function isLiteLLMThinkingSignature(signature: string | undefined): signature is string {
+	return (
+		signature !== undefined &&
+		signature !== "" &&
+		signature !== "reasoning_content" &&
+		signature !== "reasoning" &&
+		signature !== "reasoning_text"
+	);
+}
+
+/**
+ * Rebuilds LiteLLM `thinking_blocks` from a stored assistant turn. Only
+ * thinking blocks carrying a raw signature ({@link isLiteLLMThinkingSignature})
+ * replay. `transformMessages` strips signatures and redacted blocks on
+ * cross-model replays, so only the issuing model ever receives them back.
  */
 function encodeLiteLLMThinkingBlocks(content: AssistantMessage["content"]): LiteLLMThinkingBlock[] {
 	const blocks: LiteLLMThinkingBlock[] = [];
 	for (const block of content) {
 		if (block.type === "thinking") {
 			const signature = block.thinkingSignature;
-			if (
-				!signature ||
-				signature === "reasoning_content" ||
-				signature === "reasoning" ||
-				signature === "reasoning_text"
-			) {
-				continue;
-			}
+			if (!isLiteLLMThinkingSignature(signature)) continue;
 			blocks.push({ type: "thinking", thinking: block.thinking, signature });
 		} else if (block.type === "redactedThinking") {
 			blocks.push({ type: "redacted_thinking", data: block.data });
@@ -2291,6 +2297,37 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 			}
 		}
 	}
+}
+
+/**
+ * Whether chat-completions requests to `model` drop the thinking text of its
+ * own prior turns. {@link convertMessages} sends it only as a Mistral content
+ * part, demoted text, or a reasoning field, each behind a compat flag; the
+ * `whenThinking` view counts as sending, since stored thinking implies a
+ * thinking-engaged request. A block with a raw LiteLLM signature
+ * ({@link isLiteLLMThinkingSignature}) replays in `thinking_blocks` regardless.
+ * Other models' turns reach the encoder as demoted text (`transformMessages`).
+ * The agent's `Tokenizer` skips what this drops from its context estimate.
+ */
+export function completionsDropsOwnThinking(model: {
+	api?: string;
+	reasoning?: boolean;
+	compat?: Model["compat"];
+}): boolean {
+	const compat = model.compat;
+	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
+		return false;
+	}
+	const thinkingView = "whenThinking" in compat ? compat.whenThinking : undefined;
+	const views = thinkingView ? [compat, thinkingView] : [compat];
+	return !views.some(
+		view =>
+			view.mistralReasoningContentParts === true ||
+			view.requiresThinkingAsText ||
+			view.requiresReasoningContentForToolCalls ||
+			(view.thinkingFormat === "zai" && model.reasoning === true) ||
+			view.replayReasoningContent,
+	);
 }
 
 export function convertMessages(

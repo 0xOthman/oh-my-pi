@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed auto-compaction firing far below the threshold on OpenAI-compatible chat-completions models that don't replay past reasoning (e.g. `replayReasoningContent: false`): the context estimate no longer counts prior thinking the request drops ([#15797](https://github.com/can1357/oh-my-pi/issues/15797))
+
 ## [18.11.0] - 2026-10-14
 
 ### Breaking Changes

@@ -1,4 +1,5 @@
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { completionsDropsOwnThinking, isLiteLLMThinkingSignature } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { isColdReplayableResponsesTurn } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { shouldDropTruncatedThinkingOnlyAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import {
@@ -36,7 +37,7 @@ export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null
 }
 
 type TokenizerModel = Pick<Model, "tokenizer"> &
-	snapcompact.ShapeTarget & { compat?: Model["compat"]; thinking?: Model["thinking"] };
+	snapcompact.ShapeTarget & { compat?: Model["compat"]; thinking?: Model["thinking"]; reasoning?: boolean };
 
 /** The model an assistant turn's native reasoning (signed thinking, Responses history) is replayed to. */
 interface ReasoningReplayReader {
@@ -53,10 +54,19 @@ function reasoningReplayReader(model: TokenizerModel | null | undefined): Reason
 	return { api: model.api, provider: model.provider, id: model.id };
 }
 
+/** The reader whose requests drop its own turns' thinking text (`completionsDropsOwnThinking`). */
+function thinkingDropReader(model: TokenizerModel | null | undefined): ReasoningReplayReader | undefined {
+	if (!model?.api || !model.provider || !model.id || !completionsDropsOwnThinking(model)) return undefined;
+	return { api: model.api, provider: model.provider, id: model.id };
+}
+
+function readerKey(reader: ReasoningReplayReader | undefined): string {
+	return reader ? `${reader.api}\0${reader.provider}\0${reader.id}` : "";
+}
+
 /** Identity of the reader whose replayed reasoning a {@link Tokenizer} counts; equal keys count it alike. */
 export function reasoningReplayKey(model: TokenizerModel | null | undefined): string {
-	const reader = reasoningReplayReader(model);
-	return reader ? `${reader.api}\0${reader.provider}\0${reader.id}` : "";
+	return readerKey(reasoningReplayReader(model));
 }
 
 /** Request state a {@link Tokenizer} counts for, beyond its model. */
@@ -197,7 +207,7 @@ interface MessageEstimate {
  * is fixed at construction, so a cached count can never straddle two
  * encodings. An `Agent` owns one for its active model (swapping the instance
  * when the model's encoding, image or thinking-replay pricing, replay
- * identity or native-history replay state changes); one-shot flows construct
+ * identity, thinking drop or native-history replay state changes); one-shot flows construct
  * their own for the model that will be billed. Known tokenizer families use
  * exact native counts; unknown models keep the fast byte estimate (or o200k
  * when `PI_TOKENIZER_ACCURATE=1`).
@@ -209,6 +219,8 @@ export class Tokenizer {
 	readonly #reasoningReader: ReasoningReplayReader | undefined;
 	/** Claude's own API and prefix-bound hosts keep another model's signature from their deployment. */
 	readonly #readsDeploymentSignatures: boolean;
+	/** The reader whose requests drop its own turns' thinking text; see {@link thinkingDropReader}. */
+	readonly #thinkingDropper: ReasoningReplayReader | undefined;
 	readonly reasoningReplayKey: string;
 	/** How the reader bills replayed signed thinking (catalog `thinking-replay-tokens`). */
 	readonly thinkingReplayTokens: ThinkingReplayTokens;
@@ -244,6 +256,7 @@ export class Tokenizer {
 		this.#frameBilling = snapcompact.frameBilling(model ?? undefined);
 		this.frameBillingKey = snapcompact.frameBillingKey(this.#frameBilling);
 		this.#reasoningReader = reasoningReplayReader(model);
+		this.#thinkingDropper = thinkingDropReader(model);
 		const compat = model?.compat;
 		this.#readsDeploymentSignatures =
 			model?.api === "anthropic-messages" &&
@@ -416,12 +429,29 @@ export class Tokenizer {
 				const abandonedToolUse =
 					!invalidStop && message.stopReason !== "toolUse" && content.some(block => block.type === "toolCall");
 				const untrustedIndex = invalidStop ? content.length - 1 : -1;
+				// A chat-completions reader without a reasoning slot drops its own
+				// turns' thinking (`completionsDropsOwnThinking`); other models' turns
+				// reach it as demoted text.
+				const dropper = this.#thinkingDropper;
+				const ownThinkingDropped =
+					dropper !== undefined &&
+					message.api === dropper.api &&
+					message.provider === dropper.provider &&
+					message.model === dropper.id;
 				let signedReasoning = false;
 				for (let index = 0; index < content.length; index++) {
 					const block = content[index];
 					if (block.type === "text") {
 						fragments.push(block.text);
 					} else if (block.type === "thinking") {
+						const trustedSignature = !abandonedToolUse && index !== untrustedIndex;
+						// Only a trusted raw LiteLLM signature carries dropped thinking, in `thinking_blocks`.
+						if (
+							ownThinkingDropped &&
+							!(trustedSignature && isLiteLLMThinkingSignature(block.thinkingSignature))
+						) {
+							continue;
+						}
 						fragments.push(block.thinking);
 						// Providers charge for the opaque signature/reasoning payload that
 						// rides alongside the thinking text (OpenAI Responses encrypted
@@ -437,7 +467,7 @@ export class Tokenizer {
 						) {
 							fragments.push(block.thinkingSignature);
 						}
-						if (block.thinkingSignature && !abandonedToolUse && index !== untrustedIndex) signedReasoning = true;
+						if (block.thinkingSignature && trustedSignature) signedReasoning = true;
 					} else if (block.type === "toolCall") {
 						fragments.push(block.name);
 						fragments.push(stringifyJson(block.arguments) ?? "null");
@@ -541,6 +571,7 @@ export class Tokenizer {
 			tokenizerEncodingForModel(model) === this.#encoding &&
 			snapcompact.frameBillingKey(snapcompact.frameBilling(model ?? undefined)) === this.frameBillingKey &&
 			reasoningReplayKey(model) === this.reasoningReplayKey &&
+			readerKey(thinkingDropReader(model)) === readerKey(this.#thinkingDropper) &&
 			resolveThinkingReplayTokens(model ?? {}) === this.thinkingReplayTokens &&
 			(options?.nativeHistoryReplay ?? true) === this.nativeHistoryReplay
 		);

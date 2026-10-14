@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { Api, AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as natives from "@oh-my-pi/pi-natives";
 import { Agent } from "../src/agent";
@@ -345,6 +346,80 @@ describe("countMessage replayed thinking", () => {
 	test("charges the signature's bytes for a reader whose catalog prices them", () => {
 		const model = reader("google", "gemini-3-pro-preview");
 		expect(new Tokenizer(model).countMessage(signedTurn(model, VISIBLE, SIGNATURE))).toBe(VISIBLE_TOKENS + 1000);
+	});
+});
+
+// Contract: a chat-completions reader without a reasoning slot never sends its
+// own turns' thinking, so the context estimate (and every compaction trigger
+// built on it) must not count it; thinking the request does carry still counts
+// (#15797).
+describe("countMessage chat-completions thinking", () => {
+	const THINKING = "Let me reason about the call sites carefully. ".repeat(400);
+	const toolCall = { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.ts" } } as const;
+
+	function completionsModel(id: string, replayReasoningContent: boolean): Model {
+		return buildModel({
+			id,
+			name: id,
+			api: "openai-completions",
+			provider: "my-host",
+			baseUrl: "http://my-server.example:8000/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+			compat: { thinkingFormat: "qwen-chat-template", replayReasoningContent },
+		}) as Model;
+	}
+
+	function thinkingTurn(from: Pick<Model, "api" | "provider" | "id">, thinkingSignature: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "thinking", thinking: THINKING, thinkingSignature }, toolCall],
+			api: from.api,
+			provider: from.provider,
+			model: from.id,
+			usage: {
+				input: 100,
+				output: 3_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 3_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+	}
+
+	const dropping = completionsModel("Qwen3.8-27B", false);
+	const replaying = completionsModel("Qwen3.8-27B", true);
+	const toolCallOnly = new Tokenizer(dropping).countMessage({ ...thinkingTurn(dropping, "x"), content: [toolCall] });
+
+	test("skips the reader's own thinking in both arms when the request drops it", () => {
+		const tokenizer = new Tokenizer(dropping);
+		const turn = thinkingTurn(dropping, "reasoning_content");
+		expect(tokenizer.countMessage(turn)).toBe(toolCallOnly);
+		expect(tokenizer.countMessage(turn, { excludeEncryptedReasoning: true })).toBe(toolCallOnly);
+	});
+
+	test.each([
+		["a reader that replays reasoning_content", replaying, replaying, "reasoning_content"],
+		// Another model's thinking reaches the request demoted to text.
+		["another model's turn", dropping, completionsModel("other-model", false), "reasoning_content"],
+		// LiteLLM replays signed thinking in `thinking_blocks`.
+		["a raw LiteLLM signature", dropping, dropping, "EqQBCkgIARABGAIiQL"],
+	] as const)("counts thinking the request carries: %s", (_case, model, from, signature) => {
+		const floored = new Tokenizer(model).countMessage(thinkingTurn(from, signature), {
+			excludeEncryptedReasoning: true,
+		});
+		expect(floored).toBeGreaterThan(toolCallOnly + 4_000);
+	});
+
+	test("an agent re-counts when the reader's replay flag flips", () => {
+		expect(new Tokenizer(dropping).countsAlike(replaying)).toBe(false);
+		expect(new Tokenizer(dropping).countsAlike(dropping)).toBe(true);
 	});
 });
 
