@@ -37,6 +37,7 @@ import {
 	type ServerConfig,
 	type SymbolInformation,
 	type TextDocumentEdit,
+	type TextEdit,
 	type WorkspaceEdit,
 } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import { type LspToolDetails } from "@oh-my-pi/pi-tui/tools/lsp";
@@ -3557,6 +3558,126 @@ describe("lsp regressions", () => {
 
 			const symbols = await tool.execute("symbols-after-rename", { action: "symbols", file: filePath });
 			expect(textResult(symbols)).toContain("NewName");
+		} finally {
+			configCache.delete(tempDir.path());
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
+	it("renames references in an externally edited open consumer at current disk positions", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-rename-consumer-");
+		const declaration = path.join(tempDir.path(), "a.ts");
+		const consumer = path.join(tempDir.path(), "b.ts");
+		const original = 'import { answer } from "./a.js";\nexport const value = answer();\n';
+		const updated = `\n\n${original}export const newValue = answer();\n`;
+		const overlays = new Map<string, string>();
+		try {
+			await Bun.write(declaration, "export function answer() { return 42; }\n");
+			await Bun.write(consumer, original);
+			const serverConfig: ServerConfig = {
+				command: "fake-ts-lsp",
+				fileTypes: [".ts"],
+				rootMarkers: [],
+				isLinter: true,
+			};
+			installFakeLsp((message, server) => {
+				if (message.method === "initialize") {
+					server.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: { renameProvider: true } } });
+				} else if (message.method === "textDocument/didOpen") {
+					const document =
+						message.params && typeof message.params === "object" && "textDocument" in message.params
+							? message.params.textDocument
+							: null;
+					if (
+						document &&
+						typeof document === "object" &&
+						"uri" in document &&
+						"text" in document &&
+						typeof document.uri === "string" &&
+						typeof document.text === "string"
+					) {
+						overlays.set(document.uri, document.text);
+					}
+				} else if (message.method === "textDocument/didChange") {
+					const params = message.params;
+					if (
+						params &&
+						typeof params === "object" &&
+						"textDocument" in params &&
+						"contentChanges" in params &&
+						params.textDocument &&
+						typeof params.textDocument === "object" &&
+						"uri" in params.textDocument &&
+						typeof params.textDocument.uri === "string" &&
+						Array.isArray(params.contentChanges)
+					) {
+						const change: unknown = params.contentChanges[0];
+						if (change && typeof change === "object" && "text" in change && typeof change.text === "string") {
+							overlays.set(params.textDocument.uri, change.text);
+						}
+					}
+				} else if (message.method === "textDocument/documentSymbol") {
+					server.send({ jsonrpc: "2.0", id: message.id, result: [] });
+				} else if (message.method === "textDocument/references" || message.method === "textDocument/rename") {
+					const changes: Record<string, TextEdit[]> = {};
+					for (const [uri, content] of overlays) {
+						changes[uri] = content.split("\n").flatMap((text, line) =>
+							Array.from(text.matchAll(/answer/g), match => ({
+								range: {
+									start: { line, character: match.index },
+									end: { line, character: match.index + match[0].length },
+								},
+								newText: "respond",
+							})),
+						);
+					}
+					if (message.method === "textDocument/references") {
+						server.send({
+							jsonrpc: "2.0",
+							id: message.id,
+							result: Object.entries(changes).flatMap(([uri, edits]) =>
+								edits.map(edit => ({ uri, range: edit.range })),
+							),
+						});
+					} else {
+						server.send({ jsonrpc: "2.0", id: message.id, result: { changes } });
+					}
+				} else if (message.method === "shutdown") {
+					server.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					server.exit(0);
+				}
+			});
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+				servers: { "fake-ts-lsp": serverConfig },
+				idleTimeoutMs: undefined,
+			});
+			const tool = new LspTool(makeLspSession(tempDir.path()));
+			await tool.execute("open-consumer", { action: "symbols", file: consumer });
+			await tool.execute("open-declaration", { action: "references", file: declaration, line: 1, symbol: "answer" });
+			await Bun.write(consumer, updated);
+
+			const references = await tool.execute("current-references", {
+				action: "references",
+				file: declaration,
+				line: 1,
+				symbol: "answer",
+			});
+			expect(textResult(references)).toContain("Found 4 reference(s)");
+			expect(textResult(references)).toContain("b.ts:3:10");
+			expect(textResult(references)).toContain("b.ts:5:25");
+
+			const rename = await tool.execute("rename-after-external-edit", {
+				action: "rename",
+				file: declaration,
+				line: 1,
+				symbol: "answer",
+				new_name: "respond",
+			});
+			expect(rename.details?.success).toBe(true);
+			expect(await Bun.file(declaration).text()).toBe("export function respond() { return 42; }\n");
+			expect(await Bun.file(consumer).text()).toBe(updated.replaceAll("answer", "respond"));
 		} finally {
 			configCache.delete(tempDir.path());
 			await lspClient.shutdownAll();

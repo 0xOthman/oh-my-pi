@@ -1156,6 +1156,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		try {
 			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
 			const targetFile = resolvedFile;
+			const uri = targetFile ? fileToUri(targetFile) : "";
 			const isRustAnalyzerServer = isRustAnalyzerClient(client) || serverName === "rust-analyzer";
 			const needsProjectIndex =
 				targetFile !== null && PROJECT_INDEXED_ACTIONS.has(action) && isProjectAwareLspServer(serverConfig);
@@ -1165,6 +1166,16 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			let reconciledFromDisk = false;
 			if (targetFile) {
 				reconciledFromDisk = await reconcileFileFromDisk(client, targetFile, signal);
+			}
+			// Cross-file queries can return ranges in any open document. External edits
+			// to those files must reach the server before it computes reference locations
+			// or rename edits, otherwise applying its ranges to disk corrupts the files.
+			if (targetFile && (action === "references" || action === "rename")) {
+				for (const openUri of client.openFiles.keys()) {
+					if (openUri !== uri) {
+						await reconcileFileFromDisk(client, uriToFile(openUri), signal);
+					}
+				}
 			}
 			if (rustWorkspaceWait) {
 				await waitForProjectLoaded(client, signal);
@@ -1186,7 +1197,6 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					`symbol is required for project-aware ${action}; pass symbol=<name>, optionally symbol#N for repeated occurrences`,
 				);
 			}
-			const uri = targetFile ? fileToUri(targetFile) : "";
 			const resolvedLine = line ?? 1;
 			const resolvedCharacter = targetFile ? await resolveSymbolColumn(targetFile, resolvedLine, symbol) : 0;
 			const position = { line: resolvedLine - 1, character: resolvedCharacter };

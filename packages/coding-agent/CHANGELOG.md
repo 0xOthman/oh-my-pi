@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed LSP references and rename using stale positions in an already-open consumer after an external edit, which could break imports and calls while reporting success ([#15772](https://github.com/can1357/oh-my-pi/issues/15772)).
+
 ## [18.11.0] - 2026-10-14
 
 ### Added
