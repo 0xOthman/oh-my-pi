@@ -590,9 +590,10 @@ export class ChildProcess<In extends InMask = InMask> {
 
 	attachSignal(signal: AbortSignal): void {
 		const onAbort = () => this.kill(new AbortError(signal.reason, "<cancelled>"));
+		const exited = this.#exited.catch(() => {});
 		if (signal.aborted) return void onAbort();
 		signal.addEventListener("abort", onAbort, { once: true });
-		this.#exited.catch(() => {}).finally(() => signal.removeEventListener("abort", onAbort));
+		void exited.finally(() => signal.removeEventListener("abort", onAbort));
 	}
 
 	#clearTimeout(): void {

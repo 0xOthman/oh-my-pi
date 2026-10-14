@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Cancelled subprocesses no longer emit an unhandled rejection when their signal was already aborted before launch ([#15706](https://github.com/can1357/oh-my-pi/issues/15706)).
+
 ## [18.10.0] - 2026-10-12
 
 ### Added

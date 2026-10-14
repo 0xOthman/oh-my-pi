@@ -60,6 +60,27 @@ describe("ptree timeout", () => {
 		}
 	});
 
+	it("handles an already-aborted signal without an unhandled process exit", async () => {
+		const unhandled = new Set<unknown>();
+		const onUnhandled = (reason: unknown) => unhandled.add(reason);
+		process.on("unhandledRejection", onUnhandled);
+
+		try {
+			using child = spawn([process.execPath, "-e", "Bun.sleepSync(1000)"], {
+				signal: AbortSignal.abort(new Error("deadline")),
+			});
+			await child.proc.exited;
+			const nextTurn = Promise.withResolvers<void>();
+			setImmediate(nextTurn.resolve);
+			await nextTurn.promise;
+
+			expect((await child.wait({ allowAbort: true })).exitError?.aborted).toBe(true);
+			expect(unhandled.has(child.exitReason)).toBe(false);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
 	it.skipIf(process.platform !== "linux")(
 		"kills descendants adopted while an AbortSignal races the timeout sweep",
 		async () => {

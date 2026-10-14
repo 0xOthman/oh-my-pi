@@ -327,6 +327,7 @@ async function downloadTool(
 
 // Install a Python package via uv (preferred) or pip
 async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return false;
 	try {
 		// Try uv first (faster, better isolation)
 		const uv = $which("uv");
@@ -339,6 +340,7 @@ async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<
 			});
 			if (result.exitCode === 0) return true;
 		}
+		if (signal?.aborted) return false;
 
 		// Fall back to pip
 		const pip = $which("pip3") || $which("pip");
