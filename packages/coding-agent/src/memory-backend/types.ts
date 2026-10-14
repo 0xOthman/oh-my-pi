@@ -12,6 +12,7 @@ import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import type { AgentSession } from "../session/agent-session";
+import type { SessionManager } from "../session/session-manager";
 
 export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "sharpshooter";
 
@@ -120,11 +121,14 @@ export interface MemoryBackend {
 	/**
 	 * Markdown injected as the system-prompt append section.
 	 * Returned on every prompt rebuild via `refreshBaseSystemPrompt()`.
+	 * `sessionManager` is the transcript the prompt is built for; the SDK passes
+	 * it even for the initial prompt, built before `session` exists.
 	 */
 	buildDeveloperInstructions(
 		agentDir: string,
 		settings: Settings,
 		session?: AgentSession,
+		sessionManager?: SessionManager,
 	): Promise<string | undefined>;
 
 	/** Wipe all persisted state for this backend (slash `/memory clear`). */

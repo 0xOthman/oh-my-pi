@@ -221,6 +221,8 @@ describe("memories/storage", () => {
 				getSessionDir: () => sessionDir,
 				getSessionId: () => "current-thread",
 				getCwd: () => PROJECT_CWD,
+				getBranchView: () => [],
+				appendCustomEntry: () => "memory-snapshot-entry",
 			},
 			settings,
 			model,

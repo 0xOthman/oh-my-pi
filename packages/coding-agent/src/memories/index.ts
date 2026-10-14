@@ -9,6 +9,7 @@ import {
 	getAgentDbPath,
 	getMemoriesDir,
 	isEnoent,
+	isRecord,
 	logger,
 	parseJsonlLenient,
 	peekFile,
@@ -26,6 +27,7 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import type { SessionManager } from "../session/session-manager";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -160,8 +162,22 @@ export function startMemoryStartupTask(options: {
 		.finally(() => session.endLocalMemoryStartup?.(signal));
 }
 
+interface PinnedMemoryInstructions {
+	sessionFile: string | undefined;
+	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined;
+	value: string | undefined;
+}
+
+const kMemoryPin = Symbol("memories.pin");
+
+/** Session transcript a memory prompt snapshot is pinned to and recorded in. */
+type MemoryTranscript = Pick<SessionManager, "getSessionFile" | "getBranchView" | "appendCustomEntry"> & {
+	/** This process's memory block; `"reread"` makes the next build read disk instead of the recorded snapshot. */
+	[kMemoryPin]?: PinnedMemoryInstructions | "reread";
+};
+
 interface MemoryInstructionSession {
-	sessionManager: Pick<AgentSession["sessionManager"], "getSessionFile">;
+	sessionManager: MemoryTranscript;
 	agent?: { state: { messages: readonly unknown[] } };
 }
 
@@ -170,30 +186,16 @@ interface MemoryToolDeveloperInstructionsSnapshot {
 	learned: string;
 }
 
+/**
+ * Custom entry holding the `{ summary, learned }` snapshot a transcript's
+ * prompts are built from, so a resumed process rebuilds the same memory block.
+ */
+const MEMORY_SNAPSHOT_CUSTOM_TYPE = "memory-snapshot";
+
 // The first user message means a request was built from the current prompt,
 // and any signed thinking it returns is bound to that prompt.
 function memoryConversationStarted(session: MemoryInstructionSession): boolean {
 	return (session.agent?.state.messages.length ?? 0) > 0;
-}
-
-interface CachedMemoryToolDeveloperInstructions {
-	sessionFile: string | undefined;
-	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined;
-	value: string | undefined;
-}
-
-const memoryToolDeveloperInstructionsBySession = new WeakMap<
-	MemoryInstructionSession,
-	CachedMemoryToolDeveloperInstructions
->();
-const memoryToolDeveloperInstructionsByRoot = new Map<string, MemoryToolDeveloperInstructionsSnapshot | undefined>();
-
-function getMemoryInstructionRoot(agentDir: string, settings: Settings): string {
-	return getMemoryRoot(agentDir, settings.getCwd());
-}
-
-function getMemoryInstructionSessionFile(session: MemoryInstructionSession): string | undefined {
-	return session.sessionManager.getSessionFile() ?? undefined;
 }
 
 async function readMemoryToolDeveloperInstructionsSnapshot(
@@ -202,7 +204,7 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 ): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryInstructionRoot(agentDir, settings);
+	const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
 
 	let summary = "";
 	try {
@@ -213,6 +215,19 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 	}
 	const learned = await readLearnedLessons(memoryRoot);
 	return { summary, learned };
+}
+
+/** The newest snapshot recorded on the transcript's branch; `undefined` when none or malformed. */
+function recordedMemorySnapshot(transcript: MemoryTranscript): MemoryToolDeveloperInstructionsSnapshot | undefined {
+	const branch = transcript.getBranchView();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "custom" || entry.customType !== MEMORY_SNAPSHOT_CUSTOM_TYPE) continue;
+		const data = entry.data;
+		if (!isRecord(data) || typeof data.summary !== "string" || typeof data.learned !== "string") return undefined;
+		return { summary: data.summary, learned: data.learned };
+	}
+	return undefined;
 }
 
 function renderMemoryToolDeveloperInstructionsSnapshot(
@@ -244,24 +259,30 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 	});
 }
 
-function cacheMemoryToolDeveloperInstructions(
-	session: MemoryInstructionSession,
-	sessionFile: string | undefined,
+/** Pins `snapshot` for the transcript in this process and records it on the branch when it changed. */
+function pinMemoryToolDeveloperInstructions(
+	transcript: MemoryTranscript,
 	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
 	settings: Settings,
 ): string | undefined {
+	if (snapshot) {
+		const recorded = recordedMemorySnapshot(transcript);
+		if (recorded?.summary !== snapshot.summary || recorded.learned !== snapshot.learned) {
+			transcript.appendCustomEntry(MEMORY_SNAPSHOT_CUSTOM_TYPE, snapshot);
+		}
+	}
 	const value = renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
-	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot, value });
+	transcript[kMemoryPin] = { sessionFile: transcript.getSessionFile(), snapshot, value };
 	return value;
 }
 
 /**
- * Drop the per-session memory instruction snapshot after explicit memory state
+ * Drop the transcript's memory instruction snapshot after explicit memory state
  * changes that must affect the active conversation immediately, such as
- * `/memory clear`.
+ * `/memory clear`. The next build reads disk and records the result.
  */
-export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstructionSession | undefined): void {
-	if (session) memoryToolDeveloperInstructionsBySession.delete(session);
+export function clearMemoryToolDeveloperInstructionsCache(transcript: MemoryTranscript | undefined): void {
+	if (transcript) transcript[kMemoryPin] = "reread";
 }
 
 /**
@@ -270,9 +291,10 @@ export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstruc
  * Startup may finish after the first prompt build and write `memory_summary.md`.
  * The session adopts that summary only while it holds no messages: once a
  * request went out, signed thinking is bound to the prompt it carried, so the
- * new summary waits for the next session, whose cache key (session file) differs.
- * It must not reread `learned.md`, because a `learn` call racing with startup
- * belongs to the next session's memory prompt, not the active prompt-cache prefix.
+ * new summary waits for the next session, whose transcript records its own
+ * snapshot. It must not reread `learned.md`, because a `learn` call racing with
+ * startup belongs to the next session's memory prompt, not the active
+ * prompt-cache prefix.
  */
 export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	session: MemoryInstructionSession,
@@ -280,38 +302,43 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	settings: Settings,
 ): Promise<void> {
 	if (memoryConversationStarted(session)) return;
-	const sessionFile = getMemoryInstructionSessionFile(session);
-	const cached = memoryToolDeveloperInstructionsBySession.get(session);
+	const transcript = session.sessionManager;
 	const current = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
 	if (memoryConversationStarted(session)) return;
-	const root = getMemoryInstructionRoot(agentDir, settings);
-	const baseline = memoryToolDeveloperInstructionsByRoot.get(root);
-	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
-	const learned = cachedLearned ?? baseline?.learned ?? "";
-	const snapshot = current ? { summary: current.summary, learned } : undefined;
-	cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	const pin = transcript[kMemoryPin];
+	let pinned: MemoryToolDeveloperInstructionsSnapshot | undefined;
+	if (typeof pin === "object" && pin.sessionFile === transcript.getSessionFile()) pinned = pin.snapshot;
+	else if (pin !== "reread") pinned = recordedMemorySnapshot(transcript);
+	const snapshot = current ? { summary: current.summary, learned: pinned?.learned ?? current.learned } : undefined;
+	pinMemoryToolDeveloperInstructions(transcript, snapshot, settings);
 }
 
 /**
  * Build memory usage instructions for prompt injection.
+ *
+ * With a transcript, the memory block is pinned: the first build of a session
+ * records its `{ summary, learned }` snapshot on the branch, and later builds,
+ * including those of a process that resumes the session, reuse it so the
+ * prompt-cache prefix and signed thinking stay valid when other sessions learn
+ * or consolidate. A transcript without a recorded snapshot (new session,
+ * `/new`) reads disk.
  */
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
 	settings: Settings,
-	session?: MemoryInstructionSession,
+	transcript?: MemoryTranscript,
 ): Promise<string | undefined> {
-	if (!session) {
+	if (!transcript) {
 		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
-		memoryToolDeveloperInstructionsByRoot.set(getMemoryInstructionRoot(agentDir, settings), snapshot);
 		return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 	}
 
-	const sessionFile = getMemoryInstructionSessionFile(session);
-	const cached = memoryToolDeveloperInstructionsBySession.get(session);
-	if (cached && cached.sessionFile === sessionFile) return cached.value;
+	const pin = transcript[kMemoryPin];
+	if (typeof pin === "object" && pin.sessionFile === transcript.getSessionFile()) return pin.value;
 
-	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
-	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
+	const recorded = pin === "reread" ? undefined : recordedMemorySnapshot(transcript);
+	const snapshot = recorded ?? (await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings));
+	return pinMemoryToolDeveloperInstructions(transcript, snapshot, settings);
 }
 
 /**

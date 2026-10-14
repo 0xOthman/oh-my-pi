@@ -21,11 +21,11 @@ export const localBackend: MemoryBackend = {
 	start(options) {
 		startMemoryStartupTask(options);
 	},
-	async buildDeveloperInstructions(agentDir, settings, session) {
-		return buildMemoryToolDeveloperInstructions(agentDir, settings, session);
+	async buildDeveloperInstructions(agentDir, settings, session, sessionManager) {
+		return buildMemoryToolDeveloperInstructions(agentDir, settings, sessionManager ?? session?.sessionManager);
 	},
 	async clear(agentDir, cwd, session) {
-		clearMemoryToolDeveloperInstructionsCache(session);
+		clearMemoryToolDeveloperInstructionsCache(session?.sessionManager);
 		await clearMemoryData(agentDir, cwd);
 	},
 	async enqueue(agentDir, cwd) {

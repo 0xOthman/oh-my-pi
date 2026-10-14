@@ -11,9 +11,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/memories";
 import { localBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/local-backend";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -159,14 +161,6 @@ describe("learned-lesson read-back", () => {
 		await removeWithRetries(tmp);
 	});
 
-	function sessionWithFile(sessionFile: string) {
-		return {
-			sessionManager: {
-				getSessionFile: () => sessionFile,
-			},
-		};
-	}
-
 	it("injects lessons even when no consolidated summary exists", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "File-backed lesson" });
@@ -177,49 +171,71 @@ describe("learned-lesson read-back", () => {
 
 	it("keeps a session's memory prompt stable after a learned lesson is written", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
-		const session = sessionWithFile("session-1.jsonl");
+		const transcript = SessionManager.inMemory(tmp);
 
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toBeUndefined();
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, transcript)).toBeUndefined();
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Later session only" });
 
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toBeUndefined();
-		const nextSession = sessionWithFile("session-2.jsonl");
-		const out = await buildMemoryToolDeveloperInstructions(agentDir, settings, nextSession);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, transcript)).toBeUndefined();
+		const out = await buildMemoryToolDeveloperInstructions(agentDir, settings, SessionManager.inMemory(tmp));
 		expect(out).toContain("- Later session only");
+	});
+
+	it("rebuilds a resumed session's memory prompt from its transcript, not from later lessons", async () => {
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Known at session start" });
+		const original = SessionManager.create(tmp, path.join(tmp, "sessions"));
+		const sent = await buildMemoryToolDeveloperInstructions(agentDir, settings, original);
+		original.appendMessage({ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() });
+		original.appendMessage(createAssistantMessage("hello"));
+		await original.flush();
+		const sessionFile = original.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		// Another session's `learn` call lands before the next process resumes this one.
+		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Learned elsewhere later" });
+
+		const resumed = await SessionManager.open(sessionFile, path.join(tmp, "sessions"));
+		const rebuilt = await buildMemoryToolDeveloperInstructions(agentDir, settings, resumed);
+		expect(rebuilt).toBe(sent);
+		expect(rebuilt).not.toContain("Learned elsewhere later");
+
+		const fresh = await buildMemoryToolDeveloperInstructions(agentDir, settings, SessionManager.inMemory(tmp));
+		expect(fresh).toContain("Learned elsewhere later");
 	});
 
 	it("refreshes the frozen memory prompt after explicit memory clear", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
-		const session = sessionWithFile("session-clear.jsonl");
+		const session = { sessionManager: SessionManager.inMemory(tmp) };
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Clearable lesson" });
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toContain("Clearable lesson");
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager)).toContain(
+			"Clearable lesson",
+		);
 		await localBackend.clear(agentDir, settings.getCwd(), session as unknown as AgentSession);
 
-		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session)).toBeUndefined();
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager)).toBeUndefined();
 	});
 
-	it("uses the pre-session learned snapshot when startup refresh has no session cache yet", async () => {
+	it("adopts a startup summary but keeps the session's lessons while no request went out", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Prior-session lesson" });
-		const initial = await buildMemoryToolDeveloperInstructions(agentDir, settings);
-		expect(initial).toContain("Prior-session lesson");
+		const session = { sessionManager: SessionManager.inMemory(tmp) };
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager)).toContain(
+			"Prior-session lesson",
+		);
 
-		const session = sessionWithFile("session-consolidate.jsonl");
-		// The active session learns while the background pipeline is still running,
-		// before any session-scoped prompt rebuild has populated the WeakMap.
+		// The active session learns while the background pipeline is still running.
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Active-session lesson" });
 		// Background pipeline writes the consolidated summary later.
 		const root = getMemoryRoot(agentDir, settings.getCwd());
 		await Bun.write(path.join(root, "memory_summary.md"), "Consolidated guidance here.\n");
 
 		await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(session, agentDir, settings);
-		const out = await buildMemoryToolDeveloperInstructions(agentDir, settings, session);
+		const out = await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager);
 		expect(out).toContain("Consolidated guidance here.");
 		expect(out).toContain("Prior-session lesson");
 		expect(out).not.toContain("Active-session lesson");
 
-		const nextSession = sessionWithFile("session-after-consolidate.jsonl");
-		const nextOut = await buildMemoryToolDeveloperInstructions(agentDir, settings, nextSession);
+		const nextOut = await buildMemoryToolDeveloperInstructions(agentDir, settings, SessionManager.inMemory(tmp));
 		expect(nextOut).toContain("Consolidated guidance here.");
 		expect(nextOut).toContain("Active-session lesson");
 	});
@@ -227,22 +243,21 @@ describe("learned-lesson read-back", () => {
 	it("keeps the active session snapshot when startup writes a new summary after the first prompt went out", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
 		const session = {
-			sessionManager: { getSessionFile: () => "session-active-startup.jsonl" },
+			sessionManager: SessionManager.inMemory(tmp),
 			agent: { state: { messages: [{ role: "user" }] } },
 		};
 		const root = getMemoryRoot(agentDir, settings.getCwd());
 		await Bun.write(path.join(root, "memory_summary.md"), "Original guidance");
-		const initial = await buildMemoryToolDeveloperInstructions(agentDir, settings, session);
+		const initial = await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager);
 		expect(initial ?? "").toContain("Original guidance");
 
 		await Bun.write(path.join(root, "memory_summary.md"), "Updated guidance");
 		await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(session, agentDir, settings);
 
-		const active = await buildMemoryToolDeveloperInstructions(agentDir, settings, session);
+		const active = await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager);
 		expect(active ?? "").toContain("Original guidance");
 		expect(active ?? "").not.toContain("Updated guidance");
-		const nextSession = sessionWithFile("session-next-startup.jsonl");
-		const next = await buildMemoryToolDeveloperInstructions(agentDir, settings, nextSession);
+		const next = await buildMemoryToolDeveloperInstructions(agentDir, settings, SessionManager.inMemory(tmp));
 		expect(next ?? "").toContain("Updated guidance");
 	});
 
