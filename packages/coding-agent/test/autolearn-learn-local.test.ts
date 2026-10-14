@@ -215,6 +215,25 @@ describe("learned-lesson read-back", () => {
 		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, session.sessionManager)).toBeUndefined();
 	});
 
+	it("never restores memory recorded before /memory clear, even from an older branch after resume", async () => {
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Cleared lesson" });
+		const original = SessionManager.create(tmp, path.join(tmp, "sessions"));
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, original)).toContain("Cleared lesson");
+		original.appendMessage({ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() });
+		const preClearReply = original.appendMessage(createAssistantMessage("hello"));
+		await localBackend.clear(agentDir, settings.getCwd(), { sessionManager: original } as unknown as AgentSession);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, original)).toBeUndefined();
+		await original.flush();
+		const sessionFile = original.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+
+		// A resumed process navigates back to a reply whose branch only holds the pre-clear snapshot.
+		const resumed = await SessionManager.open(sessionFile, path.join(tmp, "sessions"));
+		resumed.branch(preClearReply);
+		expect(await buildMemoryToolDeveloperInstructions(agentDir, settings, resumed)).toBeUndefined();
+	});
+
 	it("adopts a startup summary but keeps the session's lessons while no request went out", async () => {
 		const settings = Settings.isolated({ "memory.backend": "local" });
 		await saveLearnedLesson(agentDir, settings.getCwd(), { content: "Prior-session lesson" });

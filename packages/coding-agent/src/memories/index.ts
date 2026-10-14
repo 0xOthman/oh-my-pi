@@ -172,8 +172,8 @@ const kMemoryPin = Symbol("memories.pin");
 
 /** Session transcript a memory prompt snapshot is pinned to and recorded in. */
 type MemoryTranscript = Pick<SessionManager, "getSessionFile" | "getBranchView" | "appendCustomEntry"> & {
-	/** This process's memory block; `"reread"` makes the next build read disk instead of the recorded snapshot. */
-	[kMemoryPin]?: PinnedMemoryInstructions | "reread";
+	/** This process's memory block for the transcript's session file. */
+	[kMemoryPin]?: PinnedMemoryInstructions;
 };
 
 interface MemoryInstructionSession {
@@ -217,14 +217,42 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 	return { summary, learned };
 }
 
-/** The newest snapshot recorded on the transcript's branch; `undefined` when none or malformed. */
-function recordedMemorySnapshot(transcript: MemoryTranscript): MemoryToolDeveloperInstructionsSnapshot | undefined {
+/**
+ * Marker `clearMemoryData` writes beside the memory root with the clear time in
+ * epoch ms. Snapshots recorded at or before it hold cleared memory, on any branch
+ * of any session, and must not be restored.
+ */
+function memoryClearMarkerPath(memoryRoot: string): string {
+	return `${memoryRoot}.cleared-at`;
+}
+
+/**
+ * The newest snapshot recorded on the transcript's branch; `undefined` when none,
+ * malformed, or recorded before the project's last `/memory clear`.
+ */
+async function recordedMemorySnapshot(
+	transcript: MemoryTranscript,
+	agentDir: string,
+	settings: Settings,
+): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
 	const branch = transcript.getBranchView();
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry.type !== "custom" || entry.customType !== MEMORY_SNAPSHOT_CUSTOM_TYPE) continue;
 		const data = entry.data;
 		if (!isRecord(data) || typeof data.summary !== "string" || typeof data.learned !== "string") return undefined;
+		let clearedAt: number;
+		try {
+			clearedAt = Number(
+				(await Bun.file(memoryClearMarkerPath(getMemoryRoot(agentDir, settings.getCwd()))).text()).trim(),
+			);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			clearedAt = Number.NEGATIVE_INFINITY;
+		}
+		// An unreadable marker or timestamp counts as cleared: rereading disk is always safe.
+		const recordedAt = Date.parse(entry.timestamp);
+		if (!(recordedAt > clearedAt)) return undefined;
 		return { summary: data.summary, learned: data.learned };
 	}
 	return undefined;
@@ -259,17 +287,15 @@ function renderMemoryToolDeveloperInstructionsSnapshot(
 	});
 }
 
-/** Pins `snapshot` for the transcript in this process and records it on the branch when it changed. */
+/** Pins `snapshot` for the transcript in this process and records it on the branch unless `recorded` holds it. */
 function pinMemoryToolDeveloperInstructions(
 	transcript: MemoryTranscript,
 	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
+	recorded: MemoryToolDeveloperInstructionsSnapshot | undefined,
 	settings: Settings,
 ): string | undefined {
-	if (snapshot) {
-		const recorded = recordedMemorySnapshot(transcript);
-		if (recorded?.summary !== snapshot.summary || recorded.learned !== snapshot.learned) {
-			transcript.appendCustomEntry(MEMORY_SNAPSHOT_CUSTOM_TYPE, snapshot);
-		}
+	if (snapshot && (recorded?.summary !== snapshot.summary || recorded.learned !== snapshot.learned)) {
+		transcript.appendCustomEntry(MEMORY_SNAPSHOT_CUSTOM_TYPE, snapshot);
 	}
 	const value = renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 	transcript[kMemoryPin] = { sessionFile: transcript.getSessionFile(), snapshot, value };
@@ -282,7 +308,7 @@ function pinMemoryToolDeveloperInstructions(
  * `/memory clear`. The next build reads disk and records the result.
  */
 export function clearMemoryToolDeveloperInstructionsCache(transcript: MemoryTranscript | undefined): void {
-	if (transcript) transcript[kMemoryPin] = "reread";
+	if (transcript) transcript[kMemoryPin] = undefined;
 }
 
 /**
@@ -306,11 +332,11 @@ export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
 	const current = await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings);
 	if (memoryConversationStarted(session)) return;
 	const pin = transcript[kMemoryPin];
-	let pinned: MemoryToolDeveloperInstructionsSnapshot | undefined;
-	if (typeof pin === "object" && pin.sessionFile === transcript.getSessionFile()) pinned = pin.snapshot;
-	else if (pin !== "reread") pinned = recordedMemorySnapshot(transcript);
+	const recorded = await recordedMemorySnapshot(transcript, agentDir, settings);
+	if (memoryConversationStarted(session)) return;
+	const pinned = pin && pin.sessionFile === transcript.getSessionFile() ? pin.snapshot : recorded;
 	const snapshot = current ? { summary: current.summary, learned: pinned?.learned ?? current.learned } : undefined;
-	pinMemoryToolDeveloperInstructions(transcript, snapshot, settings);
+	pinMemoryToolDeveloperInstructions(transcript, snapshot, recorded, settings);
 }
 
 /**
@@ -334,15 +360,16 @@ export async function buildMemoryToolDeveloperInstructions(
 	}
 
 	const pin = transcript[kMemoryPin];
-	if (typeof pin === "object" && pin.sessionFile === transcript.getSessionFile()) return pin.value;
+	if (pin && pin.sessionFile === transcript.getSessionFile()) return pin.value;
 
-	const recorded = pin === "reread" ? undefined : recordedMemorySnapshot(transcript);
+	const recorded = await recordedMemorySnapshot(transcript, agentDir, settings);
 	const snapshot = recorded ?? (await readMemoryToolDeveloperInstructionsSnapshot(agentDir, settings));
-	return pinMemoryToolDeveloperInstructions(transcript, snapshot, settings);
+	return pinMemoryToolDeveloperInstructions(transcript, snapshot, recorded, settings);
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Clear all persisted memory state and generated artifacts, and mark the clear
+ * time so no session restores a memory snapshot recorded before it.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -351,7 +378,9 @@ export async function clearMemoryData(agentDir: string, cwd: string): Promise<vo
 	} finally {
 		closeMemoryDb(db);
 	}
-	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
+	const memoryRoot = getMemoryRoot(agentDir, cwd);
+	await fs.rm(memoryRoot, { recursive: true, force: true });
+	await Bun.write(memoryClearMarkerPath(memoryRoot), String(Date.now()));
 }
 
 /**
