@@ -37,6 +37,7 @@ import {
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	EventLoopKeepalive,
+	type Tokenizer,
 	type QueuedMessagePreparation,
 	resolveTelemetry,
 	type StreamFn,
@@ -7999,7 +8000,7 @@ export class AgentSession implements SettingsScope {
 			if (maintenanceMessages !== messages && previewXdevMountNotice?.notice) {
 				maintenanceMessages.splice(xdevMountNoticeIndex, 0, previewXdevMountNotice.notice);
 			}
-			await this.#maintenance.runPrePromptCompactionIfNeeded(maintenanceMessages);
+			await this.#maintenance.runPrePromptCompactionIfNeeded(maintenanceMessages, options?.toolChoice);
 			if (this.#promptGeneration !== generation) {
 				return false;
 			}
@@ -12586,6 +12587,7 @@ export class AgentSession implements SettingsScope {
 	getContextBreakdown(options?: {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
+		tokenizer?: Tokenizer;
 	}): ContextUsageBreakdown | undefined {
 		return this.#stats.getContextBreakdown(options);
 	}

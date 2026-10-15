@@ -2342,14 +2342,14 @@ export interface OpenAICompletionsThinkingRequest {
 	disableReasoning?: boolean;
 	toolChoice?: ToolChoice;
 	hasTools?: boolean;
+	/** Advertised tools, used to verify a named force survives request construction. */
+	tools?: readonly { name: string }[];
 }
 
 /**
- * Whether a chat-completions request with `request`'s reasoning and tool state
- * drops the thinking text of `model`'s own prior turns. The compat view is
- * resolved as `buildParams` resolves it; because `buildParams` may downgrade a
- * tool choice to `"auto"` or drop it, every choice it can settle on must drop
- * the thinking, so the estimate never undercounts the request.
+ * Whether a chat-completions request drops its own prior thinking. A supported
+ * forced choice with an advertised tool survives `buildParams`; other choices
+ * may be downgraded or omitted, so count thinking if any fallback sends it.
  */
 export function completionsRequestDropsOwnThinking(model: Model, request: OpenAICompletionsThinkingRequest): boolean {
 	if (completionsDropsOwnThinking(model)) return true;
@@ -2357,18 +2357,41 @@ export function completionsRequestDropsOwnThinking(model: Model, request: OpenAI
 	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
 		return false;
 	}
-	const choices = request.toolChoice === undefined ? [undefined] : [request.toolChoice, "auto", undefined];
-	return choices.every(toolChoice =>
-		compatDropsOwnThinking(
-			model,
-			resolveOpenAICompatPolicy(model, {
-				endpoint: "chat-completions",
-				reasoning: request.reasoning,
-				disableReasoning: request.disableReasoning,
-				toolChoice,
-				hasTools: request.hasTools,
-			}).compat,
-		),
+	const forcedChoice = request.toolChoice && mapToOpenAICompletionsToolChoice(request.toolChoice);
+	const initialCompat = resolveOpenAICompatPolicy(model, {
+		endpoint: "chat-completions",
+		reasoning: request.reasoning,
+		disableReasoning: request.disableReasoning,
+		toolChoice: forcedChoice,
+		hasTools: request.hasTools,
+	}).compat;
+	if (!compatDropsOwnThinking(model, initialCompat)) return false;
+	const keepsForcedChoice =
+		forcedChoice !== undefined &&
+		isForcedToolChoice(forcedChoice) &&
+		request.hasTools === true &&
+		initialCompat.supportsToolChoice === true &&
+		initialCompat.supportsForcedToolChoice === true &&
+		(typeof forcedChoice !== "object" ||
+			(initialCompat.supportsNamedToolChoice === true &&
+				request.tools?.some(tool => tool.name === forcedChoice.function.name) === true));
+	if (request.toolChoice === undefined || keepsForcedChoice) return true;
+	const autoCompat = resolveOpenAICompatPolicy(model, {
+		endpoint: "chat-completions",
+		reasoning: request.reasoning,
+		disableReasoning: request.disableReasoning,
+		toolChoice: "auto",
+		hasTools: request.hasTools,
+	}).compat;
+	if (!compatDropsOwnThinking(model, autoCompat)) return false;
+	return compatDropsOwnThinking(
+		model,
+		resolveOpenAICompatPolicy(model, {
+			endpoint: "chat-completions",
+			reasoning: request.reasoning,
+			disableReasoning: request.disableReasoning,
+			hasTools: request.hasTools,
+		}).compat,
 	);
 }
 

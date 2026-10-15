@@ -42,7 +42,7 @@ import {
 import type { AppendOnlyContextManager } from "./append-only-context";
 import { isProviderRefusalMessage } from "./replay-policy";
 import { SentToolDefinitions } from "./sent-tool-definitions";
-import { Tokenizer } from "./tokenizer";
+import { Tokenizer, type TokenizerOptions } from "./tokenizer";
 import {
 	createAdditionalContextMessage,
 	joinAdditionalContext,
@@ -414,6 +414,7 @@ export class Agent {
 		error: undefined,
 	};
 	#tokenizer = new Tokenizer(this.#state.model);
+	#activeRequest?: { model: Model; toolChoice?: ToolChoice; tools?: Context["tools"] };
 	#listeners = new Set<(e: AgentEvent) => void>();
 	#queueListeners = new Set<() => void>();
 	#abortController?: AbortController;
@@ -865,18 +866,38 @@ export class Agent {
 		return this.#tokenizer;
 	}
 
-	/** Swap only when the effective request's count changes, retaining settled-message estimates otherwise. */
-	#syncTokenizer(model: Model | null | undefined): void {
-		const options = {
+	/** Count a pending forced-tool prompt without changing the tokenizer kept for subsequent turns. */
+	tokenizerForToolChoice(toolChoice: ToolChoice | undefined): Tokenizer {
+		const model = this.#state.model;
+		const active = this.tokenizer;
+		if (!model || !toolChoice) return active;
+		const options = this.#tokenizerOptions(model, { model, toolChoice, tools: this.#state.tools });
+		return active.countsAlike(model, options) ? active : new Tokenizer(model, options);
+	}
+
+	#tokenizerOptions(
+		model: Model | null | undefined,
+		request?: { model: Model; toolChoice?: ToolChoice; tools?: Context["tools"] },
+	): TokenizerOptions {
+		const tools = request ? request.tools : this.#state.tools;
+		return {
 			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState),
 			dropsOwnThinking: model
 				? completionsRequestDropsOwnThinking(model, {
 						reasoning: this.#state.thinkingLevel,
 						disableReasoning: this.#state.disableReasoning,
-						hasTools: this.#state.tools.length > 0,
+						toolChoice: request?.toolChoice,
+						hasTools: (tools?.length ?? 0) > 0,
+						tools,
 					})
 				: undefined,
 		};
+	}
+
+	/** Swap only when the effective request's count changes, retaining settled-message estimates otherwise. */
+	#syncTokenizer(model: Model | null | undefined): void {
+		const request = this.#activeRequest?.model === model ? this.#activeRequest : undefined;
+		const options = this.#tokenizerOptions(model, request);
 		if (!this.#tokenizer.countsAlike(model, options)) this.#tokenizer = new Tokenizer(model, options);
 	}
 
@@ -1934,8 +1955,17 @@ export class Agent {
 			transformAssistantMessagePreservesToolCalls: this.transformAssistantMessagePreservesToolCalls,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
-			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
+			onTurnEnd: (messages, signal, context) => {
+				// The next request may not carry this turn's forced tool choice.
+				this.#activeRequest = undefined;
+				this.#syncTokenizer(this.#state.model);
+				return this.#onTurnEnd?.(messages, signal, context);
+			},
 			getToolChoice,
+			syncTokenizerForRequest: request => {
+				this.#activeRequest = request;
+				this.#syncTokenizer(request.model);
+			},
 			softToolRequirementState: this.#softToolRequirementState,
 			onToolChoiceRejected: () => {
 				if (claimedToolChoice !== undefined) this.#deferredToolChoice = claimedToolChoice;
@@ -2185,6 +2215,8 @@ export class Agent {
 				this.#emit({ type: "agent_end", messages: [errorMsg] });
 			}
 		} finally {
+			this.#activeRequest = undefined;
+			this.#syncTokenizer(this.#state.model);
 			this.#restoreUndeliveredQueuedMessages(loopAbortController);
 			resolveRun?.();
 			if (this.#abortController === loopAbortController) {

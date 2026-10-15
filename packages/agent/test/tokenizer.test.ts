@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import type { Api, AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { completionsRequestDropsOwnThinking, convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as natives from "@oh-my-pi/pi-natives";
 import { Agent } from "../src/agent";
+import type { AgentTool } from "../src/types";
 import type { SessionMessageEntry } from "../src/compaction/entries";
 import { applyShakeRegions, collectShakeRegions, RESCUE_SHAKE_CONFIG } from "../src/compaction/shake";
 import { Tokenizer, tokenizerEncodingForModel } from "../src/tokenizer";
@@ -479,6 +482,55 @@ describe("countMessage chat-completions thinking", () => {
 		);
 		agent.setThinkingLevel(undefined);
 		expect(agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true })).toBe(toolCallOnly);
+	});
+
+	test("a forced Kimi request drops past thinking without undercounting the next turn", async () => {
+		const model = buildModel({
+			id: "kimi-k2.6",
+			name: "Kimi",
+			api: "openai-completions",
+			provider: "opencode-go",
+			baseUrl: "https://opencode.ai/zen/go/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+		});
+		const schema = type({});
+		const tool: AgentTool<typeof schema, Record<string, never>> = {
+			name: "read",
+			label: "Read",
+			description: "Read a file",
+			parameters: schema,
+			async execute() {
+				return { content: [{ type: "text", text: "done" }], details: {} };
+			},
+		};
+		const mock = createMockModel({ responses: [{ content: ["forced"] }, { content: ["normal"] }] });
+		const agent = new Agent({ streamFn: mock.stream });
+		agent.setModel(model);
+		agent.setThinkingLevel(Effort.Medium);
+		agent.setTools([tool]);
+		const turn = thinkingTurn(model, "reasoning_content");
+		const counts: number[] = [];
+		agent.setBeforeModelCall(() => {
+			counts.push(agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true }));
+		});
+		const turnEndCounts: number[] = [];
+		agent.setOnTurnEnd(() => {
+			turnEndCounts.push(agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true }));
+		});
+		await agent.prompt("call read", { toolChoice: { type: "tool", name: "read" } });
+		expect(turnEndCounts[0]).toBeGreaterThan(toolCallOnly + 4_000);
+		expect(agent.tokenizer.countMessage(turn, { excludeEncryptedReasoning: true })).toBeGreaterThan(
+			toolCallOnly + 4_000,
+		);
+		await agent.prompt("answer normally");
+		expect(mock.calls.map(call => call.options?.toolChoice)).toEqual([{ type: "tool", name: "read" }, undefined]);
+		expect(counts).toEqual([toolCallOnly, expect.any(Number)]);
+		expect(counts[1]).toBeGreaterThan(toolCallOnly + 4_000);
+		expect(turnEndCounts[1]).toBeGreaterThan(toolCallOnly + 4_000);
 	});
 });
 
