@@ -106,6 +106,7 @@ import {
 	isCompiledGrammarTooLargeStrictError,
 	isStrictToolsDisabledForScope,
 	type OpenAICompatPolicy,
+	type OpenAICompatPolicyCompat,
 	type OpenAICompletionsParams,
 	type OpenAIPromptCacheOptions,
 	type OpenAIRequestSetup,
@@ -2300,33 +2301,24 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 }
 
 /**
- * Whether chat-completions requests to `model` drop the thinking text of its
- * own prior turns. {@link convertMessages} sends it only as a Mistral content
- * part, demoted text, or a reasoning field, each behind a compat flag; the
- * `whenThinking` view counts as sending, since stored thinking implies a
- * thinking-engaged request. A block with a raw LiteLLM signature
- * ({@link isLiteLLMThinkingSignature}) replays in `thinking_blocks` regardless.
- * Other models' turns reach the encoder as demoted text (`transformMessages`).
- * The agent's `Tokenizer` skips what this drops from its context estimate.
+ * Whether chat-completions requests drop the reader's own prior thinking under
+ * the selected request compat. The caller passes the effective compat from
+ * `resolveOpenAICompatPolicy`; omitting it counts the model's base view.
+ * LiteLLM blocks with raw signatures still replay via `thinking_blocks`.
  */
-export function completionsDropsOwnThinking(model: {
-	api?: string;
-	reasoning?: boolean;
-	compat?: Model["compat"];
-}): boolean {
-	const compat = model.compat;
+export function completionsDropsOwnThinking(
+	model: { api?: string; reasoning?: boolean; compat?: Model["compat"] },
+	compat: Model["compat"] | OpenAICompatPolicyCompat | undefined = model.compat,
+): boolean {
 	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
 		return false;
 	}
-	const thinkingView = "whenThinking" in compat ? compat.whenThinking : undefined;
-	const views = thinkingView ? [compat, thinkingView] : [compat];
-	return !views.some(
-		view =>
-			view.mistralReasoningContentParts === true ||
-			view.requiresThinkingAsText ||
-			view.requiresReasoningContentForToolCalls ||
-			(view.thinkingFormat === "zai" && model.reasoning === true) ||
-			view.replayReasoningContent,
+	return !(
+		compat.mistralReasoningContentParts === true ||
+		compat.requiresThinkingAsText ||
+		compat.requiresReasoningContentForToolCalls ||
+		(compat.thinkingFormat === "zai" && model.reasoning === true) ||
+		compat.replayReasoningContent
 	);
 }
 

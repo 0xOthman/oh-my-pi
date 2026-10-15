@@ -1,6 +1,6 @@
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { completionsDropsOwnThinking, isLiteLLMThinkingSignature } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import { isColdReplayableResponsesTurn } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { isColdReplayableResponsesTurn, type OpenAICompatPolicyCompat } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { shouldDropTruncatedThinkingOnlyAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import {
 	getOpenAIResponsesHistoryItems,
@@ -55,8 +55,11 @@ function reasoningReplayReader(model: TokenizerModel | null | undefined): Reason
 }
 
 /** The reader whose requests drop its own turns' thinking text (`completionsDropsOwnThinking`). */
-function thinkingDropReader(model: TokenizerModel | null | undefined): ReasoningReplayReader | undefined {
-	if (!model?.api || !model.provider || !model.id || !completionsDropsOwnThinking(model)) return undefined;
+function thinkingDropReader(
+	model: TokenizerModel | null | undefined,
+	compat?: OpenAICompatPolicyCompat,
+): ReasoningReplayReader | undefined {
+	if (!model?.api || !model.provider || !model.id || !completionsDropsOwnThinking(model, compat)) return undefined;
 	return { api: model.api, provider: model.provider, id: model.id };
 }
 
@@ -78,6 +81,8 @@ export interface TokenizerOptions {
 	 * reasoning or its signature. Default: true.
 	 */
 	nativeHistoryReplay?: boolean;
+	/** Effective chat-completions request policy; omitted for the model's base view. */
+	completionsCompat?: OpenAICompatPolicyCompat;
 }
 
 /**
@@ -256,7 +261,7 @@ export class Tokenizer {
 		this.#frameBilling = snapcompact.frameBilling(model ?? undefined);
 		this.frameBillingKey = snapcompact.frameBillingKey(this.#frameBilling);
 		this.#reasoningReader = reasoningReplayReader(model);
-		this.#thinkingDropper = thinkingDropReader(model);
+		this.#thinkingDropper = thinkingDropReader(model, options?.completionsCompat);
 		const compat = model?.compat;
 		this.#readsDeploymentSignatures =
 			model?.api === "anthropic-messages" &&
@@ -571,7 +576,7 @@ export class Tokenizer {
 			tokenizerEncodingForModel(model) === this.#encoding &&
 			snapcompact.frameBillingKey(snapcompact.frameBilling(model ?? undefined)) === this.frameBillingKey &&
 			reasoningReplayKey(model) === this.reasoningReplayKey &&
-			readerKey(thinkingDropReader(model)) === readerKey(this.#thinkingDropper) &&
+			readerKey(thinkingDropReader(model, options?.completionsCompat)) === readerKey(this.#thinkingDropper) &&
 			resolveThinkingReplayTokens(model ?? {}) === this.thinkingReplayTokens &&
 			(options?.nativeHistoryReplay ?? true) === this.nativeHistoryReplay
 		);

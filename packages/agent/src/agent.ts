@@ -23,6 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import { resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -849,11 +850,8 @@ export class Agent {
 	}
 
 	/**
-	 * Tokenizer for the active model. The instance is replaced whenever the
-	 * active model's encoding, image or thinking-replay pricing, or
-	 * replayed-reasoning reader changes (see {@link setModel}), or its Responses
-	 * session turns cold or warm, so callers must not cache it across model
-	 * switches or requests.
+	 * Tokenizer for the active request. Reasoning and tool availability can
+	 * change the chat-completions compat view without changing the model.
 	 */
 	get tokenizer(): Tokenizer {
 		// The provider warms or closes a session inside a request, so the replay
@@ -867,14 +865,20 @@ export class Agent {
 		return this.#tokenizer;
 	}
 
-	/**
-	 * Swap the tokenizer only when the encoding, image or thinking-replay
-	 * pricing, replayed-reasoning reader or native-history replay state
-	 * actually changes, so the warm
-	 * per-message memo survives same-pricing model switches.
-	 */
+	/** Swap only when the effective request's count changes, retaining settled-message estimates otherwise. */
 	#syncTokenizer(model: Model | null | undefined): void {
-		const options = { nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState) };
+		const options = {
+			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState),
+			completionsCompat:
+				model?.api === "openai-completions"
+					? resolveOpenAICompatPolicy(model, {
+							endpoint: "chat-completions",
+							reasoning: this.#state.thinkingLevel,
+							disableReasoning: this.#state.disableReasoning,
+							hasTools: Boolean(this.#state.tools?.length),
+						}).compat
+					: undefined,
+		};
 		if (!this.#tokenizer.countsAlike(model, options)) this.#tokenizer = new Tokenizer(model, options);
 	}
 
@@ -1254,10 +1258,12 @@ export class Agent {
 
 	setThinkingLevel(l: Effort | undefined) {
 		this.#state.thinkingLevel = l;
+		this.#syncTokenizer(this.#state.model);
 	}
 
 	setDisableReasoning(disabled: boolean) {
 		this.#state.disableReasoning = disabled;
+		this.#syncTokenizer(this.#state.model);
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time") {
@@ -1286,6 +1292,7 @@ export class Agent {
 
 	setTools(t: AgentTool<any>[]) {
 		this.#state.tools = t;
+		this.#syncTokenizer(this.#state.model);
 	}
 
 	replaceMessages(ms: AgentMessage[]) {
