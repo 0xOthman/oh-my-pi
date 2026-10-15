@@ -2300,25 +2300,75 @@ function maybeAddAnthropicCacheControl(compat: ResolvedOpenAICompat, messages: C
 	}
 }
 
-/**
- * Whether chat-completions requests drop the reader's own prior thinking under
- * the selected request compat. The caller passes the effective compat from
- * `resolveOpenAICompatPolicy`; omitting it counts the model's base view.
- * LiteLLM blocks with raw signatures still replay via `thinking_blocks`.
- */
-export function completionsDropsOwnThinking(
-	model: { api?: string; reasoning?: boolean; compat?: Model["compat"] },
-	compat: Model["compat"] | OpenAICompatPolicyCompat | undefined = model.compat,
-): boolean {
-	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
-		return false;
-	}
+/** Whether {@link convertMessages} drops the reader's own prior thinking text under `compat`. */
+function compatDropsOwnThinking(model: { reasoning?: boolean }, compat: OpenAICompatPolicyCompat): boolean {
 	return !(
 		compat.mistralReasoningContentParts === true ||
 		compat.requiresThinkingAsText ||
 		compat.requiresReasoningContentForToolCalls ||
 		(compat.thinkingFormat === "zai" && model.reasoning === true) ||
 		compat.replayReasoningContent
+	);
+}
+
+/**
+ * Whether every chat-completions request to `model` drops the thinking text of
+ * its own prior turns: neither the base compat nor its `whenThinking` view
+ * sends it. Counters that don't know the request's reasoning state (one-shot
+ * budgets, output fitting without options) rely on this so they never
+ * undercount; {@link completionsRequestDropsOwnThinking} narrows it to one
+ * request. A block with a raw LiteLLM signature
+ * ({@link isLiteLLMThinkingSignature}) replays in `thinking_blocks` regardless,
+ * and other models' turns reach the encoder as demoted text
+ * (`transformMessages`). The agent's `Tokenizer` skips what this drops.
+ */
+export function completionsDropsOwnThinking(model: {
+	api?: string;
+	reasoning?: boolean;
+	compat?: Model["compat"];
+}): boolean {
+	const compat = model.compat;
+	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
+		return false;
+	}
+	if (!compatDropsOwnThinking(model, compat)) return false;
+	const thinkingView = "whenThinking" in compat ? compat.whenThinking : undefined;
+	return thinkingView === undefined || compatDropsOwnThinking(model, thinkingView);
+}
+
+/** Request state that selects the chat-completions compat view {@link convertMessages} encodes with. */
+export interface OpenAICompletionsThinkingRequest {
+	reasoning?: string;
+	disableReasoning?: boolean;
+	toolChoice?: ToolChoice;
+	hasTools?: boolean;
+}
+
+/**
+ * Whether a chat-completions request with `request`'s reasoning and tool state
+ * drops the thinking text of `model`'s own prior turns. The compat view is
+ * resolved as `buildParams` resolves it; because `buildParams` may downgrade a
+ * tool choice to `"auto"` or drop it, every choice it can settle on must drop
+ * the thinking, so the estimate never undercounts the request.
+ */
+export function completionsRequestDropsOwnThinking(model: Model, request: OpenAICompletionsThinkingRequest): boolean {
+	if (completionsDropsOwnThinking(model)) return true;
+	const compat = model.compat;
+	if (model.api !== "openai-completions" || compat === undefined || !("replayReasoningContent" in compat)) {
+		return false;
+	}
+	const choices = request.toolChoice === undefined ? [undefined] : [request.toolChoice, "auto", undefined];
+	return choices.every(toolChoice =>
+		compatDropsOwnThinking(
+			model,
+			resolveOpenAICompatPolicy(model, {
+				endpoint: "chat-completions",
+				reasoning: request.reasoning,
+				disableReasoning: request.disableReasoning,
+				toolChoice,
+				hasTools: request.hasTools,
+			}).compat,
+		),
 	);
 }
 

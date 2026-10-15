@@ -23,7 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
-import { resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { completionsRequestDropsOwnThinking } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -869,15 +869,13 @@ export class Agent {
 	#syncTokenizer(model: Model | null | undefined): void {
 		const options = {
 			nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState),
-			completionsCompat:
-				model?.api === "openai-completions"
-					? resolveOpenAICompatPolicy(model, {
-							endpoint: "chat-completions",
-							reasoning: this.#state.thinkingLevel,
-							disableReasoning: this.#state.disableReasoning,
-							hasTools: Boolean(this.#state.tools?.length),
-						}).compat
-					: undefined,
+			dropsOwnThinking: model
+				? completionsRequestDropsOwnThinking(model, {
+						reasoning: this.#state.thinkingLevel,
+						disableReasoning: this.#state.disableReasoning,
+						hasTools: this.#state.tools.length > 0,
+					})
+				: undefined,
 		};
 		if (!this.#tokenizer.countsAlike(model, options)) this.#tokenizer = new Tokenizer(model, options);
 	}

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { Api, AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
-import { completionsDropsOwnThinking, convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { completionsRequestDropsOwnThinking, convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { resolveOpenAICompatPolicy } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -442,22 +442,24 @@ describe("countMessage chat-completions thinking", () => {
 	])("matches the encoded request for $name", ({ replay, effort, alternate, disabled }) => {
 		const model = completionsModel("Qwen3.8-27B", replay, alternate);
 		const turn = thinkingTurn(model, "reasoning_content");
-		const policy = resolveOpenAICompatPolicy(model, {
-			endpoint: "chat-completions",
-			reasoning: effort,
-			disableReasoning: disabled,
-			hasTools: true,
-		});
+		const request = { reasoning: effort, disableReasoning: disabled, hasTools: true };
+		const selected = resolveOpenAICompatPolicy(model, { endpoint: "chat-completions", ...request }).compat;
 		const compat =
-			model.compat.whenThinking && policy.compat === model.compat.whenThinking
-				? model.compat.whenThinking
-				: model.compat;
-		const wire = convertMessages(model, { messages: [turn] }, compat);
-		const carriesThinking = JSON.stringify(wire).includes(THINKING);
-		expect(completionsDropsOwnThinking(model, policy.compat)).toBe(!carriesThinking);
-		const tokenizer = new Tokenizer(model, { completionsCompat: policy.compat });
-		const count = tokenizer.countMessage(turn, { excludeEncryptedReasoning: true });
+			model.compat.whenThinking && selected === model.compat.whenThinking ? model.compat.whenThinking : model.compat;
+		const carriesThinking = JSON.stringify(convertMessages(model, { messages: [turn] }, compat)).includes(THINKING);
+		const dropsOwnThinking = completionsRequestDropsOwnThinking(model, request);
+		expect(dropsOwnThinking).toBe(!carriesThinking);
+		const count = new Tokenizer(model, { dropsOwnThinking }).countMessage(turn, { excludeEncryptedReasoning: true });
 		expect(count > toolCallOnly + 4_000).toBe(carriesThinking);
+	});
+
+	test("counts thinking any request may send when the request state is unknown", () => {
+		// One-shot budgets and output fitting without options must not undercount.
+		const model = completionsModel("Qwen3.8-27B", false, true);
+		const count = new Tokenizer(model).countMessage(thinkingTurn(model, "reasoning_content"), {
+			excludeEncryptedReasoning: true,
+		});
+		expect(count).toBeGreaterThan(toolCallOnly + 4_000);
 	});
 
 	test("the agent re-estimates saved thinking when reasoning is turned off", () => {
