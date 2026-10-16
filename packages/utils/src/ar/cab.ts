@@ -2,13 +2,7 @@ import * as zlib from "node:zlib";
 import { readUInt16LE, readUInt32LE } from "./bytes";
 import { LzxDecoder } from "./codecs/lzx";
 import { ArchiveError } from "./error";
-import {
-	type ArchiveLimits,
-	assertArchiveMemberSize,
-	assertEntryCount,
-	assertIndexSize,
-	assertInMemorySize,
-} from "./limits";
+import { type ArchiveLimits, assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
 import { assertArchivePathBytes, normalizeArchiveEntryPath } from "./paths";
 import type { ByteSource } from "./source";
 import type { ArchiveIndexEntry, FormatReader, MemberSource } from "./types";
@@ -339,7 +333,6 @@ async function readCabArchive(source: ByteSource, options: Parameters<FormatRead
 		if (folderIndex >= folders.length)
 			throw new ArchiveError("Invalid CAB archive: CFFILE references a missing folder");
 		const rawName = decodeName(nameBytes, (attributes & ATTRIBUTE_UTF8_NAME) !== 0);
-		assertArchiveMemberSize(size, rawName, options.limits);
 		const end = folderOffset + size;
 		if (!Number.isSafeInteger(end)) throw new ArchiveError("Invalid CAB archive: CFFILE range is too large");
 		if (end > descriptions[folderIndex]!.requiredSize) descriptions[folderIndex]!.requiredSize = end;

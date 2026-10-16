@@ -1,6 +1,6 @@
 import { crc16Arc } from "./checksums";
 import { ArchiveError } from "./error";
-import { assertArchiveMemberSize, assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
+import { assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
 import { assertArchivePathBytes, assertArchivePathString, normalizeArchiveEntryPath } from "./paths";
 import { type ByteSource, readAllBytes } from "./source";
 import type { ArchiveIndexEntry, FormatReader, FormatReadOptions, MemberSource } from "./types";
@@ -574,7 +574,6 @@ function parseLzhHeader(bytes: Uint8Array, offset: number, options: FormatReadOp
 	const directory = fields.unicodeDirectory ?? fields.directory ?? "";
 	const rawPath = `${directory}${directory && !/[\\/]$/.test(directory) ? "/" : ""}${filename}`;
 	assertArchivePathString(rawPath, "member path", options.limits.maxPathBytes);
-	assertArchiveMemberSize(size, rawPath || "<unnamed>", options.limits);
 	assertRange(bytes, dataStart, dataStart + packedSize, "member data");
 	return {
 		method,

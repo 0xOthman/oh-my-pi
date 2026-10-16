@@ -1,6 +1,6 @@
 import { crc32 } from "./checksums";
 import { ArchiveError } from "./error";
-import { assertArchiveMemberSize, assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
+import { assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
 import { decompressLhStatic } from "./lzh";
 import { assertArchivePathBytes, assertArchivePathString, normalizeArchiveEntryPath } from "./paths";
 import { type ByteSource, readAllBytes } from "./source";
@@ -284,7 +284,6 @@ export const readArj: FormatReader = async (
 		);
 		const rawPath = normalizeHostPath(filename.value, hostOs);
 		assertArchivePathString(rawPath, "member path", options.limits.maxPathBytes);
-		assertArchiveMemberSize(size, rawPath || "<unnamed>", options.limits);
 		const dataStart = block.nextOffset;
 		assertRange(bytes, dataStart, dataStart + packedSize, "member data");
 		offset = dataStart + packedSize;

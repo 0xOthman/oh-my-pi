@@ -160,7 +160,7 @@ test("rejects traversal, malformed records, truncation, and non-zero Pickle padd
 	}
 });
 
-test("enforces header, entry, member, and path limits before indexing", async () => {
+test("enforces header, entry, and path limits before indexing", async () => {
 	const bytes = headerFixture({ one: { size: 1, offset: "0" }, two: { size: 0, offset: "1" } }, new Uint8Array([1]));
 	await expect(
 		readAsar(memoryByteSource(bytes), {
@@ -172,11 +172,6 @@ test("enforces header, entry, member, and path limits before indexing", async ()
 			limits: { ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 1 },
 		}),
 	).rejects.toThrow("too many entries");
-	await expect(
-		readAsar(memoryByteSource(bytes), {
-			limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 0 },
-		}),
-	).rejects.toThrow("too large to extract");
 	await expect(
 		readAsar(memoryByteSource(headerFixture({ lengthy: { size: 0, offset: "0" } })), {
 			limits: { ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 3 },

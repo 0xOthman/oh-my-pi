@@ -406,7 +406,6 @@ function parseRar5(bytes: Uint8Array, marker: number, options: FormatReadOptions
 				}
 			}
 			if (type === 2) {
-				assertArchiveMemberSize(unpackedSize, rawPath, options.limits);
 				const path = normalizeArchiveEntryPath(rawPath);
 				if (path) {
 					let linkResolveTarget: boolean | undefined;
@@ -542,7 +541,6 @@ function parseRar4(bytes: Uint8Array, marker: number, options: FormatReadOptions
 					if (timeIndex === 0) mtimeMs = preciseMs;
 				}
 			}
-			assertArchiveMemberSize(unpackedSize, rawPath, options.limits);
 			const path = normalizeArchiveEntryPath(rawPath);
 			if (path) {
 				const directory = ((flags >>> 5) & 7) === 7;

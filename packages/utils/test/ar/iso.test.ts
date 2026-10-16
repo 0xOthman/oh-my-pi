@@ -153,7 +153,7 @@ test("detects High Sierra and UDF-only images with precise errors", async () => 
 	}
 });
 
-test("enforces metadata, entry, member, and path limits", async () => {
+test("enforces metadata, entry, and path limits", async () => {
 	const bytes = await fixtureBytes();
 	await expect(
 		readIso(memoryByteSource(bytes), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxIndexSize: 2047 } }),
@@ -161,9 +161,6 @@ test("enforces metadata, entry, member, and path limits", async () => {
 	await expect(
 		readIso(memoryByteSource(bytes), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 2 } }),
 	).rejects.toThrow("too many entries");
-	await expect(
-		readIso(memoryByteSource(bytes), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 8 } }),
-	).rejects.toThrow("too large to extract");
 	await expect(
 		readIso(memoryByteSource(bytes), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 5 } }),
 	).rejects.toThrow("member name exceeds 5 bytes");

@@ -99,7 +99,7 @@ describe("7z container", () => {
 		await expect(extract(ppmd)).rejects.toThrow("PPMd");
 	});
 
-	test("detects truncation, payload corruption, and member-size limits", async () => {
+	test("detects truncation and payload corruption", async () => {
 		const original = await fixture("sevenzip-copy.7z");
 		await expect(
 			readSevenZip(memoryByteSource(original.subarray(0, 20)), { limits: DEFAULT_ARCHIVE_LIMITS }),
@@ -108,10 +108,5 @@ describe("7z container", () => {
 		corrupt[32] ^= 0x80;
 		const corruptIndex = await readSevenZip(memoryByteSource(corrupt), { limits: DEFAULT_ARCHIVE_LIMITS });
 		await expect(extract(at(corruptIndex, "nested/message.txt"))).rejects.toBeInstanceOf(ArchiveError);
-		await expect(
-			readSevenZip(memoryByteSource(original), {
-				limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 1 },
-			}),
-		).rejects.toThrow("too large");
 	});
 });

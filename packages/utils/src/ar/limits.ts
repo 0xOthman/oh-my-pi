@@ -15,7 +15,7 @@ export interface ArchiveLimits {
 	maxInMemorySize: number;
 	/** Max bytes for archive metadata (ZIP central directory, ASAR JSON header, RAR/7z header areas). */
 	maxIndexSize: number;
-	/** Max declared bytes for a single extracted member. */
+	/** Max declared bytes for a single extracted member; enforced on extraction, never while indexing, so oversized members still list. */
 	maxMemberSize: number;
 	/** Max byte length of a member path or link target. */
 	maxPathBytes: number;

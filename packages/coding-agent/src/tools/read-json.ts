@@ -4,13 +4,18 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { Shell } from "@oh-my-pi/pi-natives";
 import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import { DEFAULT_MAX_LINES, truncateHead, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { DEFAULT_MAX_LINES, truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isEnoent, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
 import { quotePosixArgument } from "../utils/shell-quote";
 import { resolveReadPath } from "./path-utils";
-import { buildInMemorySelectorResult, prependSuffixResolutionNotice, toReadTruncationStats } from "./read-format";
+import {
+	buildInMemorySelectorResult,
+	prependSuffixResolutionNotice,
+	toReadTruncationStats,
+	truncateReadHead,
+} from "./read-format";
 import {
 	findSuffixMatchCached,
 	isNotFoundError,
@@ -425,7 +430,7 @@ export async function readJson(
 		}
 	}
 
-	const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES });
+	const truncation = truncateReadHead(output, { maxLines: DEFAULT_MAX_LINES });
 	details.truncation = truncation.truncated ? toReadTruncationStats(truncation) : undefined;
 	const resultBuilder = toolResult<ReadToolDetails>(details)
 		.text(truncation.content)

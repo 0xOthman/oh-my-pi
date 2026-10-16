@@ -14,6 +14,7 @@ import type { ToolSession } from "../sdk";
 import {
 	DEFAULT_MAX_BYTES,
 	noTruncResult,
+	type TruncationOptions,
 	type TruncationResult,
 	truncateHead,
 	truncateHeadBytes,
@@ -39,6 +40,28 @@ import { cfgReadRenderMarkdown } from "./settings";
 export function toReadTruncationStats(result: TruncationResult): ReadTruncationStats {
 	const { content: _content, ...stats } = result;
 	return stats;
+}
+
+/**
+ * Head-truncate read output for display. Where `truncateHead` returns empty
+ * content for a first line over the byte budget, this keeps that line's
+ * UTF-8-safe byte prefix as one partial line (`firstLineExceedsLimit` stays
+ * set, `totalBytes` becomes the line's size), so an oversized single value
+ * never reads back as nothing. Used by the in-memory and JSON-query read paths.
+ */
+export function truncateReadHead(text: string, options: TruncationOptions = {}): TruncationResult {
+	const truncation = truncateHead(text, options);
+	if (!truncation.firstLineExceedsLimit) return truncation;
+	const newline = text.indexOf("\n");
+	const firstLine = newline === -1 ? text : text.slice(0, newline);
+	const snippet = truncateHeadBytes(firstLine, options.maxBytes ?? DEFAULT_MAX_BYTES);
+	return {
+		...truncation,
+		content: snippet.text,
+		totalBytes: Buffer.byteLength(firstLine, "utf-8"),
+		outputLines: snippet.bytes > 0 ? 1 : 0,
+		outputBytes: snippet.bytes,
+	};
 }
 
 function prependLineNumbers(text: string, startNum: number): string {
@@ -385,7 +408,7 @@ export async function buildInMemoryTextResult(
 	const joinSelectedLines = (): string =>
 		(allLines ? allLines.slice(startLine, endLine) : selectedRange.split("\n")).join("\n");
 	const userLimitedLines = limit !== undefined ? endLine - startLine : undefined;
-	const truncation = ignoreResultLimits ? noTruncResult(selectedRange) : truncateHead(selectedRange);
+	const truncation = ignoreResultLimits ? noTruncResult(selectedRange) : truncateReadHead(selectedRange);
 	// Any display short of the whole text shows block context around it.
 	if (
 		!rawDisplay &&
@@ -448,19 +471,17 @@ export async function buildInMemoryTextResult(
 		| undefined;
 
 	if (truncation.firstLineExceedsLimit) {
-		const firstLine = allLines ? (allLines[startLine] ?? "") : selectedRange.split("\n", 1)[0];
-		const firstLineBytes = Buffer.byteLength(firstLine, "utf-8");
-		const snippet = truncateHeadBytes(firstLine, DEFAULT_MAX_BYTES);
+		const firstLineBytes = truncation.totalBytes;
 
 		if (shouldAddHashLines) {
 			outputText = `[Line ${startLineDisplay} is ${formatBytes(
 				firstLineBytes,
 			)}, exceeds ${formatBytes(DEFAULT_MAX_BYTES)} limit. Hashline output requires full lines; cannot emit an editable numbered preview for a truncated line.]`;
 		} else {
-			outputText = formatText(snippet.text, startLineDisplay);
+			outputText = formatText(truncation.content, startLineDisplay);
 		}
 
-		if (snippet.text.length === 0) {
+		if (truncation.content.length === 0) {
 			outputText = `[Line ${startLineDisplay} is ${formatBytes(
 				firstLineBytes,
 			)}, exceeds ${formatBytes(DEFAULT_MAX_BYTES)} limit. Unable to display a valid UTF-8 snippet.]`;

@@ -184,7 +184,7 @@ test("detects unsupported compression parameters and verifies extraction size", 
 	await expect(root.storage.source.read(root.size + 1, root.path)).rejects.toThrow("size changed");
 });
 
-test("enforces index, entry, member, path, and in-memory folder limits", async () => {
+test("enforces index, entry, path, and in-memory folder limits", async () => {
 	const fixture = await fixtureBytes("cab-none.cab");
 	await expect(
 		readCab(memoryByteSource(fixture), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxIndexSize: 64 } }),
@@ -192,9 +192,6 @@ test("enforces index, entry, member, path, and in-memory folder limits", async (
 	await expect(
 		readCab(memoryByteSource(fixture), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 2 } }),
 	).rejects.toThrow("too many entries");
-	await expect(
-		readCab(memoryByteSource(fixture), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 16 } }),
-	).rejects.toThrow("too large to extract");
 	await expect(
 		readCab(memoryByteSource(fixture), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 7 } }),
 	).rejects.toThrow("member path exceeds 7 bytes");

@@ -123,11 +123,6 @@ describe("Unix ar", () => {
 
 		await expect(
 			readUnixAr(memoryByteSource(original), {
-				limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 8 },
-			}),
-		).rejects.toThrow("too large to extract");
-		await expect(
-			readUnixAr(memoryByteSource(original), {
 				limits: { ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 10 },
 			}),
 		).rejects.toThrow("member path exceeds 10 bytes");

@@ -159,12 +159,11 @@ describe("tar reader", () => {
 		expect(() => index(multiVolume)).toThrow("multi-volume tar members are not supported");
 	});
 
-	test("enforces archive, member, path, entry, and metadata limits", async () => {
+	test("enforces archive, path, entry, and metadata limits", async () => {
 		const bytes = await fixture("tar-ustar.tar");
 		expect(() => index(bytes, { ...DEFAULT_ARCHIVE_LIMITS, maxInMemorySize: bytes.byteLength - 1 })).toThrow(
 			"too large to read in memory",
 		);
-		expect(() => index(bytes, { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 3 })).toThrow("too large to extract");
 		expect(() => index(bytes, { ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 5 })).toThrow("exceeds 5 bytes");
 		expect(() => index(bytes, { ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 1 })).toThrow("too many entries");
 		const pax = await fixture("tar-pax-long.tar");

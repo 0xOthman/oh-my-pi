@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed archive indexing rejecting a whole archive when one member exceeds `maxMemberSize`; the cap now applies only when extracting that member ([#16018](https://github.com/can1357/oh-my-pi/issues/16018))
+
 ## [18.11.2] - 2026-10-16
 
 ### Added

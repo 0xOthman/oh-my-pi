@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { Settings } from "../../src/config/settings";
 import { resolveLocalUrlToPath } from "../../src/internal-urls";
 import { ReadTool } from "../../src/tools/read";
@@ -120,6 +121,21 @@ describe("JSON query in read tool", () => {
 		const text = getText(result);
 		const lines = text.trim().split("\n");
 		expect(lines).toEqual(["alice", "charlie"]);
+	});
+
+	it("returns a byte prefix with a partial-line notice when one output line exceeds the display limit", async () => {
+		const value = "x".repeat(DEFAULT_MAX_BYTES * 2);
+		const bigFile = path.join(tempDir, "big-value.json");
+		await fs.writeFile(bigFile, JSON.stringify({ value }), "utf-8");
+
+		const result = await readTool.execute("call_big", { path: `${bigFile}?q=.value&raw=true` });
+
+		expect(getText(result)).toBe(value.slice(0, DEFAULT_MAX_BYTES));
+		expect(result.details?.meta?.truncation).toMatchObject({
+			partialLine: true,
+			outputBytes: DEFAULT_MAX_BYTES,
+			totalBytes: value.length,
+		});
 	});
 
 	it("fails cleanly with descriptive error on invalid jq syntax", async () => {

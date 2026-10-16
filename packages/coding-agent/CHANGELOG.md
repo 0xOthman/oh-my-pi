@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `read` of a JSON query whose single output line exceeds the display limit returning no data; it now shows a byte prefix with a partial-line notice ([#16018](https://github.com/can1357/oh-my-pi/issues/16018))
+- Fixed `read` of an archive failing with "too large to extract in memory" when any member exceeds 64 MB; the archive now lists, and only reading that member fails ([#16018](https://github.com/can1357/oh-my-pi/issues/16018))
+
 ## [18.11.2] - 2026-10-16
 
 ### Added

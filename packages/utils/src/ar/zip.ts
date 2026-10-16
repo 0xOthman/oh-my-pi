@@ -504,11 +504,6 @@ function parseCentralDirectory(
 		}
 		const normalizedPath = normalizeArchiveEntryPath(rawPath);
 		if (normalizedPath) {
-			assertArchiveMemberSize(
-				Math.max(values.uncompressedSize, values.compressedSize),
-				normalizedPath,
-				options.limits,
-			);
 			const host = versionMadeBy >>> 8;
 			const mode = host === UNIX_HOST || host === OSX_HOST ? externalAttributes >>> 16 : undefined;
 			const fileType = mode === undefined ? 0 : mode & FILE_TYPE_MASK;

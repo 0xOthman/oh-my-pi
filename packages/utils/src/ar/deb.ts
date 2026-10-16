@@ -6,7 +6,7 @@ import { xzDecompress } from "./codecs/xz";
 import { zstdDecompress } from "./codecs/zstd";
 import { ensureParentDirectories, upsertArchiveEntry } from "./entries";
 import { ArchiveError } from "./error";
-import { assertInMemorySize } from "./limits";
+import { type ArchiveLimits, assertArchiveMemberSize, assertInMemorySize } from "./limits";
 import { normalizeArchiveEntryPath } from "./paths";
 import type { ByteSource } from "./source";
 import { readTarEntriesFromBuffer } from "./tar";
@@ -102,10 +102,12 @@ function prefixControlEntry(entry: ArchiveIndexEntry): ArchiveIndexEntry {
 	};
 }
 
-async function readOuterMember(entry: ArchiveIndexEntry): Promise<Uint8Array> {
+/** Read a compressed control/data tarball; it is extracted into memory, so the member cap applies. */
+async function readOuterMember(entry: ArchiveIndexEntry, limits: ArchiveLimits): Promise<Uint8Array> {
 	if (entry.isDirectory || entry.storage?.type !== "member") {
 		throw new ArchiveError(`Invalid deb archive member '${entry.path}'`);
 	}
+	assertArchiveMemberSize(entry.size, entry.path, limits);
 	return entry.storage.source.read(entry.size, entry.path);
 }
 
@@ -133,7 +135,7 @@ async function readDebImpl(source: ByteSource, options: FormatReadOptions): Prom
 			upsertArchiveEntry(result, outerEntry);
 			continue;
 		}
-		const compressed = await readOuterMember(outerEntry);
+		const compressed = await readOuterMember(outerEntry, options.limits);
 		const tarBytes = await decompressDebTar(compressed, tar.compression, options);
 		const innerEntries = readTarEntriesFromBuffer(tarBytes, options);
 		for (const innerEntry of innerEntries) {

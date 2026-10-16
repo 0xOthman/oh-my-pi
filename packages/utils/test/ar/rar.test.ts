@@ -170,9 +170,6 @@ test("RAR corruption, traversal, and limits fail safely", async () => {
 	const damagedEntries = await readRar(memoryByteSource(damagedPayload), { limits: DEFAULT_ARCHIVE_LIMITS });
 	await expect(extract(findEntry(damagedEntries, "input/hello.txt"))).rejects.toThrow("CRC32 mismatch");
 	await expect(
-		readRar(memoryByteSource(original), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 5 } }),
-	).rejects.toThrow("too large");
-	await expect(
 		readRar(memoryByteSource(original), { limits: { ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 1 } }),
 	).rejects.toThrow("too many entries");
 });

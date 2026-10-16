@@ -167,12 +167,11 @@ test("drops traversal names and rejects encryption, truncation, unsupported meth
 	await expect(readMember(findEntry(corruptEntries, "plain.txt"))).rejects.toThrow("CRC mismatch");
 });
 
-test("enforces entry, index, member, and path limits before metadata-driven work", async () => {
+test("enforces entry, index, and path limits before metadata-driven work", async () => {
 	const bytes = await fixture("zip-basic.zip");
 	for (const limits of [
 		{ ...DEFAULT_ARCHIVE_LIMITS, maxEntries: 1 },
 		{ ...DEFAULT_ARCHIVE_LIMITS, maxIndexSize: 8 },
-		{ ...DEFAULT_ARCHIVE_LIMITS, maxMemberSize: 8 },
 		{ ...DEFAULT_ARCHIVE_LIMITS, maxPathBytes: 4 },
 	]) {
 		await expect(readZip(memoryByteSource(bytes), { limits })).rejects.toBeInstanceOf(ArchiveError);

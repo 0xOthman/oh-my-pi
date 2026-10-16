@@ -2,13 +2,7 @@ import * as path from "node:path";
 import { bytesMatchAscii } from "./bytes";
 import { resolveArchiveLinkPath, upsertArchiveEntry } from "./entries";
 import { ArchiveError } from "./error";
-import {
-	type ArchiveLimits,
-	assertArchiveMemberSize,
-	assertEntryCount,
-	assertIndexSize,
-	assertInMemorySize,
-} from "./limits";
+import { type ArchiveLimits, assertEntryCount, assertIndexSize, assertInMemorySize } from "./limits";
 import {
 	assertArchivePathBytes,
 	assertArchivePathString,
@@ -560,7 +554,6 @@ export function readTarEntriesFromBuffer(buffer: Uint8Array, options: FormatRead
 			continue;
 		}
 		if (typeFlag !== "0" && typeFlag !== "\0" && typeFlag !== "7" && typeFlag !== "S") continue;
-		assertArchiveMemberSize(displaySize, normalizedPath, limits);
 		addEntry({
 			path: normalizedPath,
 			isDirectory: false,

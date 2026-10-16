@@ -200,11 +200,15 @@ describe("read truncation metadata", () => {
 			firstLineExceedsLimit: true,
 			lastLinePartial: false,
 			totalLines: 2,
-			totalBytes: DEFAULT_MAX_BYTES + 6,
-			outputLines: 0,
-			outputBytes: 0,
+			totalBytes: DEFAULT_MAX_BYTES + 1,
+			outputLines: 1,
+			outputBytes: DEFAULT_MAX_BYTES,
 		});
-		expect(result.details?.meta?.truncation).toMatchObject({ partialLine: true, shownRange: { start: 1, end: 1 } });
+		expect(result.details?.meta?.truncation).toMatchObject({
+			partialLine: true,
+			shownRange: { start: 1, end: 1 },
+			outputBytes: DEFAULT_MAX_BYTES,
+		});
 	});
 
 	it.each(["directory", "archive", "sqlite"] as const)(
