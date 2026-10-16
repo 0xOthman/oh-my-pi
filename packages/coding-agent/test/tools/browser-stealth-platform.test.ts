@@ -37,13 +37,34 @@ interface NavigatorIdentity {
 	workers: Record<string, ContextIdentity>;
 }
 
+interface DeviceIdentity extends ContextIdentity {
+	brands: Array<{ brand: string; version: string }>;
+	mobile: boolean;
+	architecture: string;
+	platformVersion: string;
+	requestUserAgent: string;
+}
+
 const REPORT =
 	"({ userAgent: navigator.userAgent, platform: navigator.platform, uaPlatform: navigator.userAgentData.platform })";
+const DEVICE_REPORT = `async () => {
+	const hints = await navigator.userAgentData.getHighEntropyValues(["architecture", "platformVersion"]);
+	return {
+		...${REPORT},
+		brands: navigator.userAgentData.brands,
+		mobile: navigator.userAgentData.mobile,
+		architecture: hints.architecture,
+		platformVersion: hints.platformVersion,
+		requestUserAgent: await (await fetch("/ua")).text(),
+	};
+}`;
 const WORKER_SCRIPTS: Record<string, string> = {
 	"/worker.js": `postMessage(${REPORT});`,
 	"/nested.js": `const worker = new Worker(new URL("/worker.js", location.origin)); worker.onmessage = event => postMessage(event.data);`,
 	"/shared.js": `onconnect = event => event.ports[0].postMessage(${REPORT});`,
 	"/sw.js": `onmessage = event => event.source.postMessage(${REPORT});`,
+	"/device-shared.js": `onconnect = async event => event.ports[0].postMessage(await (${DEVICE_REPORT})());`,
+	"/device-sw.js": `onmessage = async event => event.source.postMessage(await (${DEVICE_REPORT})());`,
 };
 
 const IDENTITY_CODE = `return await tab.evaluate(async source => {
@@ -129,6 +150,7 @@ beforeAll(() => {
 		hostname: "127.0.0.1",
 		port: 0,
 		fetch: request => {
+			if (new URL(request.url).pathname === "/ua") return new Response(request.headers.get("user-agent"));
 			const script = WORKER_SCRIPTS[new URL(request.url).pathname];
 			if (script) return new Response(script, { headers: { "Content-Type": "text/javascript" } });
 			return new Response("<!doctype html><title>platform fixture</title>", {
@@ -171,22 +193,44 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("headless stealth navigator identity", () =
 	it("leaves a device-emulated tab's workers reporting the device identity", async () => {
 		await prelude.invoke({ action: "open", name: "platform-device", url: pageUrl }, context);
 		try {
-			const { page, worker } = await runInTab<{ page: ContextIdentity; worker: ContextIdentity }>(
+			const { page, worker, shared, service } = await runInTab<{
+				page: DeviceIdentity;
+				worker: ContextIdentity;
+				shared: DeviceIdentity;
+				service: DeviceIdentity;
+			}>(
 				"platform-device",
 				`await tab.emulate({ device: "iPhone 14" });
-await tab.goto(${JSON.stringify(pageUrl)});
+await tab.goto(${JSON.stringify(`${pageUrl}device/`)});
 return await tab.evaluate(async () => {
-	const report = Promise.withResolvers();
-	new Worker("/worker.js", { name: "device" }).onmessage = event => report.resolve(event.data);
-	const { userAgent, platform, uaPlatform } = await report.promise;
+	const workerReport = Promise.withResolvers();
+	new Worker("/worker.js", { name: "device" }).onmessage = event => workerReport.resolve(event.data);
+	const sharedReport = Promise.withResolvers();
+	const port = new SharedWorker("/device-shared.js", { name: "device-shared" }).port;
+	port.onmessage = event => sharedReport.resolve(event.data);
+	port.start();
+	await navigator.serviceWorker.register("/device-sw.js", { scope: "/device/" });
+	const registration = await navigator.serviceWorker.ready;
+	const serviceReport = Promise.withResolvers();
+	navigator.serviceWorker.onmessage = event => serviceReport.resolve(event.data);
+	registration.active.postMessage("report");
+	const page = await (${DEVICE_REPORT})();
 	return {
-		page: { userAgent: navigator.userAgent, platform: navigator.platform, uaPlatform: navigator.userAgentData.platform },
-		worker: { userAgent, platform, uaPlatform },
+		page: { ...page, platform: navigator.platform },
+		worker: await workerReport.promise,
+		shared: await sharedReport.promise,
+		service: await serviceReport.promise,
 	};
 });`,
 			);
 			expect(page.userAgent).toContain("iPhone");
-			expect(worker).toEqual(page);
+			expect(worker).toEqual({
+				userAgent: page.userAgent,
+				platform: page.platform,
+				uaPlatform: page.uaPlatform,
+			});
+			expect(shared).toEqual(page);
+			expect(service).toEqual(page);
 		} finally {
 			await prelude.invoke({ action: "close", name: "platform-device" }, context);
 		}

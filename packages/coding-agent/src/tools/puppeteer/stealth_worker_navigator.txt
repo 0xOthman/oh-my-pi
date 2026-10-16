@@ -1,11 +1,9 @@
 // Evaluated over CDP in every new worker realm before its script runs (see
 // patchWorkersBeforeStart in launch.ts). Dedicated workers inherit the page's UA
 // override but keep the host `navigator.platform`; shared and service workers keep
-// the host `HeadlessChrome` UA and UA-CH too until the browser-side override
-// reaches them. `identity` is the stealth override: `{ userAgent, platform, uaData }`.
-// A realm whose UA is neither the host's nor the stealth one belongs to a tab with
-// device emulation and is left as the page left it. Pages and repeated evaluations
-// are no-ops.
+// the host `HeadlessChrome` UA and UA-CH until the browser-side override reaches
+// them. `identity` is the active tab's UA override; the CDP target handler
+// scopes device overrides to the tab's origin before evaluating this script.
 identity => {
 	if (typeof WorkerGlobalScope === "undefined" || !(self instanceof WorkerGlobalScope)) return;
 	const nav = self.navigator;
@@ -63,14 +61,17 @@ identity => {
 
 	// Nothing is patched yet, so these reads see the realm's native identity.
 	const nativeUserAgent = String(nav.userAgent);
-	const hostUserAgent = nativeUserAgent.includes("HeadlessChrome/");
-	if (!hostUserAgent && nativeUserAgent !== identity.userAgent) return;
+	if (
+		!nativeUserAgent.includes("HeadlessChrome/") &&
+		nativeUserAgent !== identity.stealthUserAgent &&
+		nativeUserAgent !== identity.userAgent
+	) return;
 	const replaceGetter = (target, prop, value) =>
 		patch(target, prop, "get", (native, receiver) => {
 			Reflect_apply(native, receiver, []);
 			return value;
 		});
-	if (hostUserAgent) replaceGetter(nav, "userAgent", identity.userAgent);
+	if (nativeUserAgent !== identity.userAgent) replaceGetter(nav, "userAgent", identity.userAgent);
 	if (nav.platform !== identity.platform) replaceGetter(nav, "platform", identity.platform);
 
 	const uaData = identity.uaData;
@@ -78,17 +79,28 @@ identity => {
 	try {
 		data = nav.userAgentData;
 	} catch {}
-	if (data && data.platform !== uaData.platform) {
+	const nativeBrands = data?.brands;
+	let brandsDiffer = Boolean(nativeBrands && nativeBrands.length !== uaData.brands.length);
+	for (let i = 0; nativeBrands && !brandsDiffer && i < nativeBrands.length; i++) {
+		brandsDiffer =
+			nativeBrands[i].brand !== uaData.brands[i].brand || nativeBrands[i].version !== uaData.brands[i].version;
+	}
+	if (data && (data.platform !== uaData.platform || data.mobile !== uaData.mobile || brandsDiffer || nativeUserAgent !== identity.userAgent)) {
 		const spoof = values => {
-			for (const key of ["platform", "platformVersion", "architecture", "bitness", "model"]) {
+			for (const key of ["brands", "mobile", "platform", "platformVersion", "architecture", "bitness", "model", "fullVersionList"]) {
 				if (values && key in values && key in uaData) values[key] = uaData[key];
 			}
+			if (values && "uaFullVersion" in values) values.uaFullVersion = uaData.fullVersion;
 			return values;
 		};
-		patch(data, "platform", "get", (native, receiver) => {
-			Reflect_apply(native, receiver, []);
-			return uaData.platform;
-		});
+		if (data.platform !== uaData.platform) replaceGetter(data, "platform", uaData.platform);
+		if (data.mobile !== uaData.mobile) replaceGetter(data, "mobile", uaData.mobile);
+		if (brandsDiffer) {
+			patch(data, "brands", "get", (native, receiver) => {
+				Reflect_apply(native, receiver, []);
+				return uaData.brands.map(brand => ({ ...brand }));
+			});
+		}
 		patch(data, "getHighEntropyValues", "value", (native, receiver, args) =>
 			Reflect_apply(Promise_then, Reflect_apply(native, receiver, args), [spoof]),
 		);

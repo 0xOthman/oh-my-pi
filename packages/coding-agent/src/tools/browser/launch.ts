@@ -763,6 +763,20 @@ export interface UserAgentOverride {
 	};
 }
 
+interface UserAgentClientHints {
+	brands: Array<{ brand: string; version: string }>;
+	platform: string;
+	mobile: boolean;
+	getHighEntropyValues(hints: string[]): Promise<{
+		architecture?: string;
+		bitness?: string;
+		model?: string;
+		platformVersion?: string;
+		fullVersionList?: Array<{ brand: string; version: string }>;
+		uaFullVersion?: string;
+	}>;
+}
+
 function resolvePageClient(page: Page): PuppeteerCdpClient | null {
 	const pageWithClient = page as Page & {
 		_client?: (() => PuppeteerCdpClient) | PuppeteerCdpClient;
@@ -865,60 +879,95 @@ function wrapSession(session: CDPSession): PuppeteerCdpClient {
 	};
 }
 
-async function sendUserAgentOverride(client: PuppeteerCdpClient, override: UserAgentOverride): Promise<void> {
-	try {
-		await client.send("Network.enable");
-	} catch {}
-	try {
-		await client.send("Network.setUserAgentOverride", override as unknown as Record<string, unknown>);
-	} catch (error) {
-		logger.debug("Failed to apply Network user agent override", {
-			error: error instanceof Error ? error.message : String(error),
+async function sendUserAgentOverride(
+	client: PuppeteerCdpClient,
+	override: UserAgentOverride,
+	options?: { queueBeforeStart: boolean },
+): Promise<void> {
+	const enabled = client.send("Network.enable").catch(() => undefined);
+	if (!options?.queueBeforeStart) await enabled;
+	const network = client
+		.send("Network.setUserAgentOverride", override as unknown as Record<string, unknown>)
+		.catch(error => {
+			logger.debug("Failed to apply Network user agent override", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		});
-	}
-	try {
-		await client.send("Emulation.setUserAgentOverride", override as unknown as Record<string, unknown>);
-	} catch (error) {
-		logger.debug("Failed to apply Emulation user agent override", {
-			error: error instanceof Error ? error.message : String(error),
+	if (!options?.queueBeforeStart) await network;
+	const emulation = client
+		.send("Emulation.setUserAgentOverride", override as unknown as Record<string, unknown>)
+		.catch(error => {
+			logger.debug("Failed to apply Emulation user agent override", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 		});
-	}
+	if (options?.queueBeforeStart) await Promise.all([enabled, network, emulation]);
+	else await emulation;
 }
 
+/** Long-lived headless UA override, including the current tab's worker identity. */
 export interface UserAgentSession {
-	override: UserAgentOverride;
+	override: UserAgentOverride | null;
 	browserSession: CDPSession | null;
+	worker?: {
+		page: Page;
+		nativePlatform: string;
+		override: UserAgentOverride | null;
+	};
 }
 
 /** Configure UA override on the browser + auto-attach to new targets. */
 async function configureUserAgentTargets(
 	browser: Browser,
-	state: { browserSession: CDPSession | null; override: UserAgentOverride },
+	state: UserAgentSession & { override: UserAgentOverride },
 	targetTimeoutMs = USER_AGENT_TARGET_TIMEOUT_MS,
 ): Promise<void> {
 	if (!state.browserSession) {
 		state.browserSession = await browser.target().createCDPSession();
-		patchWorkersBeforeStart(state.browserSession, state.override);
-		await state.browserSession.send("Target.setAutoAttach", {
-			autoAttach: true,
-			waitForDebuggerOnStart: false,
-			flatten: true,
-		});
+		patchWorkersBeforeStart(state.browserSession, state);
 		state.browserSession.on(
 			"Target.attachedToTarget",
-			async (event: { sessionId: string; targetInfo?: { type?: string } }) => {
+			async (event: { sessionId: string; targetInfo?: { type?: string; url?: string } }) => {
 				const type = event.targetInfo?.type;
-				if (!type || !(USER_AGENT_TARGET_TYPES.has(type) || USER_AGENT_WORKER_TARGET_TYPES[type])) return;
 				const connection = state.browserSession?.connection();
 				const session = connection?.session(event.sessionId);
 				if (!session) return;
-				await withSoftTimeout(
-					sendUserAgentOverride(wrapSession(session), state.override),
-					targetTimeoutMs,
-					"new target user-agent override",
-				);
+				try {
+					if (!type || !USER_AGENT_WORKER_TARGET_TYPES[type]) return;
+					const worker = state.worker;
+					const workerOverride = worker?.override;
+					const pageUrl = worker?.page.url();
+					const targetUrl = event.targetInfo?.url;
+					const sameOrigin = Boolean(
+						pageUrl &&
+						targetUrl &&
+						URL.canParse(pageUrl) &&
+						URL.canParse(targetUrl) &&
+						new URL(pageUrl).origin === new URL(targetUrl).origin,
+					);
+					// Only the tab at this origin supplies the worker's request identity.
+					if (worker && !sameOrigin) return;
+					const deviceWorker = Boolean(workerOverride && sameOrigin);
+					const override = deviceWorker && workerOverride ? workerOverride : state.override;
+					const applied = sendUserAgentOverride(wrapSession(session), override, { queueBeforeStart: true });
+					if (deviceWorker && workerOverride) {
+						session
+							.send("Runtime.evaluate", {
+								expression: workerNavigatorExpression(state.override, workerOverride),
+							})
+							.catch(() => undefined);
+					}
+					await withSoftTimeout(applied, targetTimeoutMs, "new target user-agent override");
+				} finally {
+					await session.send("Runtime.runIfWaitingForDebugger").catch(() => undefined);
+				}
 			},
 		);
+		await state.browserSession.send("Target.setAutoAttach", {
+			autoAttach: true,
+			waitForDebuggerOnStart: true,
+			flatten: true,
+		});
 	}
 
 	const targets = browser.targets().filter(targetSupportsUserAgentOverride);
@@ -941,24 +990,30 @@ function targetInfoSupportsUserAgentOverride(targetInfo: { type?: string } | und
 	return Boolean(targetInfo?.type && USER_AGENT_TARGET_TYPES.has(targetInfo.type));
 }
 
-/**
- * Every worker keeps the host `navigator.platform`, and shared/service workers also
- * report the host UA and UA-CH until the long-lived session's override reaches them,
- * so a script patches those values in each new worker realm. Puppeteer attaches every
- * new target paused (`waitForDebuggerOnStart`) and resumes it from its
- * `Target.attachedToTarget` handler. The connection emits `sessionattached` before
- * dispatching that event and a session runs commands in order, so the evaluate lands
- * before the worker's script. The handler cannot see the target type, so it must not
- * send overrides here: page sessions would clobber device emulation.
- */
-function patchWorkersBeforeStart(browserSession: CDPSession, override: UserAgentOverride): void {
+function workerNavigatorExpression(stealth: UserAgentOverride, override: UserAgentOverride): string {
 	const identity = {
 		userAgent: override.userAgent,
 		platform: override.platform,
 		uaData: override.userAgentMetadata,
+		stealthUserAgent: stealth.userAgent,
 	};
-	const expression = `(${stealthWorkerNavigatorScript})(${JSON.stringify(identity)})`;
+	return `(${stealthWorkerNavigatorScript})(${JSON.stringify(identity)})`;
+}
+
+/**
+ * Patch worker realms before their scripts start. Puppeteer emits `sessionattached`
+ * before it resumes the target; the listener cannot see the target type, so device
+ * workers use the typed `Target.attachedToTarget` handler instead.
+ */
+function patchWorkersBeforeStart(
+	browserSession: CDPSession,
+	state: UserAgentSession & { override: UserAgentOverride },
+): void {
+	const expression = workerNavigatorExpression(state.override, state.override);
 	browserSession.connection()?.on("sessionattached", session => {
+		// Device-emulated workers are patched in Target.attachedToTarget, where the
+		// target type and origin are known; evaluating on a device page can crash it.
+		if (state.worker?.override) return;
 		// The script ignores non-worker realms; targets without a Runtime domain (tabs) reject.
 		session.send("Runtime.evaluate", { expression }).catch(() => undefined);
 	});
@@ -1130,24 +1185,66 @@ export function buildStealthInjectionScriptForTest(scripts: readonly string[] = 
 }
 
 /** Apply stealth patches + UA override to a headless page. Idempotent within a tab. */
-export async function applyStealthPatches(
-	browser: Browser,
-	page: Page,
-	state: { browserSession: CDPSession | null; override: UserAgentOverride | null },
-): Promise<void> {
+export async function applyStealthPatches(browser: Browser, page: Page, state: UserAgentSession): Promise<void> {
 	if (!state.override) {
 		state.override = await resolveUserAgentOverride(page);
 	}
+	state.worker ??= { page, nativePlatform: await page.evaluate(() => navigator.platform), override: null };
+	state.worker.page = page;
 	// UA/language overrides are session-scoped; detached target sessions do not
 	// replace the primary client override, and setUserAgent has no language option.
 	const client = resolvePageClient(page);
 	if (client) {
 		await sendUserAgentOverride(client, state.override);
 	}
-	const targetState = { browserSession: state.browserSession, override: state.override };
+	const targetState = { browserSession: state.browserSession, override: state.override, worker: state.worker };
 	await configureUserAgentTargets(browser, targetState);
 	state.browserSession = targetState.browserSession;
 	await injectStealthScripts(page);
+}
+
+/** Keep new browser-level workers aligned with the active page after device or UA emulation. */
+export async function refreshStealthWorkerIdentity(state: UserAgentSession): Promise<void> {
+	const worker = state.worker;
+	if (!worker || !state.override) return;
+	const active = await worker.page.evaluate(async () => {
+		const data: UserAgentClientHints | undefined = Reflect.get(navigator, "userAgentData");
+		const hints = await data?.getHighEntropyValues([
+			"architecture",
+			"bitness",
+			"model",
+			"platformVersion",
+			"fullVersionList",
+			"uaFullVersion",
+		]);
+		return {
+			userAgent: navigator.userAgent,
+			brands: data?.brands ?? [],
+			platform: data?.platform ?? "",
+			mobile: data?.mobile ?? false,
+			hints,
+		};
+	});
+	if (active.userAgent === state.override.userAgent) {
+		worker.override = null;
+		return;
+	}
+	worker.override = {
+		...state.override,
+		userAgent: active.userAgent,
+		platform: worker.nativePlatform,
+		userAgentMetadata: {
+			brands: active.brands,
+			fullVersion: active.hints?.uaFullVersion ?? "",
+			fullVersionList: active.hints?.fullVersionList ?? [],
+			platform: active.platform,
+			platformVersion: active.hints?.platformVersion ?? "",
+			architecture: active.hints?.architecture ?? "",
+			bitness: active.hints?.bitness ?? "",
+			model: active.hints?.model ?? "",
+			mobile: active.mobile,
+		},
+	};
 }
 
 /** Exposes executable candidates for detection tests. */

@@ -66,6 +66,8 @@ import {
 	loadedKnownDevices,
 	loadedNetworkConditions,
 	readPageViewport,
+	refreshStealthWorkerIdentity,
+	type UserAgentSession,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableExtractOptions, type ReadableFormat } from "./readable";
 import { assertTabPressArgs } from "./tab-arguments";
@@ -1487,6 +1489,7 @@ export class WorkerCore {
 	#tracing?: BrowserTracingController;
 	#ariaSnapshotBaselines = new Map<string, AriaSnapshotBaseline>();
 	#emulation?: BrowserEmulationController;
+	readonly #stealth: UserAgentSession = { browserSession: null, override: null };
 	#screenshotHistory = new Map<string, ScreenshotHistory>();
 	#webmcp?: WebMcpController;
 	readonly #recording = new RecordingController();
@@ -1646,7 +1649,7 @@ export class WorkerCore {
 					this.#transport.send({ type: "page-created", targetId });
 				});
 				this.#observeDialogs();
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
+				await applyStealthPatches(this.#browser, this.#page, this.#stealth);
 				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			} else {
@@ -1672,7 +1675,10 @@ export class WorkerCore {
 			}
 			this.#webmcp = await installWebMcp(this.#page);
 			await installVitalsObservers(this.#page);
-			if (payload.userAgent !== undefined) await applyUserAgentOverride(this.#page, payload.userAgent);
+			if (payload.userAgent !== undefined) {
+				await applyUserAgentOverride(this.#page, payload.userAgent);
+				if (payload.mode === "headless") await refreshStealthWorkerIdentity(this.#stealth);
+			}
 			if (payload.ignoreHttpsErrors) await applyIgnoreHttpsErrors(this.#page);
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#initScripts = new InitScriptManager(this.#page);
@@ -2876,7 +2882,15 @@ export class WorkerCore {
 					{ selector, zeroMatchAfterMs: ZERO_MATCH_FAIL_FAST_MS },
 				),
 			emulate: opts =>
-				op("tab.emulate()", actionOpMs, sig => untilAborted(sig, () => this.#requireEmulation().emulate(opts))),
+				op("tab.emulate()", actionOpMs, sig =>
+					untilAborted(sig, async () => {
+						const state = await this.#requireEmulation().emulate(opts);
+						if (this.#mode === "headless" && (opts?.device !== undefined || opts?.userAgent !== undefined)) {
+							await refreshStealthWorkerIdentity(this.#stealth);
+						}
+						return state;
+					}),
+				),
 			devices: () =>
 				op("tab.devices()", quickOpMs, async sig => {
 					throwIfAborted(sig);
