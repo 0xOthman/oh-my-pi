@@ -954,7 +954,7 @@ async function configureUserAgentTargets(
 					const worker = state.worker;
 					const url = event.targetInfo?.url ?? "";
 					worker?.targets.set(session, url);
-					const tabOverride = worker && sameOrigin(worker.page.url(), url) ? worker.override : null;
+					const tabOverride = worker && pageHasOrigin(worker.page, url) ? worker.override : null;
 					// An emulating tab leaves other origins' workers to the tabs at those origins.
 					if (worker?.override && !tabOverride) return;
 					const override = tabOverride ?? state.override;
@@ -1003,6 +1003,10 @@ function sameOrigin(a: string, b: string): boolean {
 	if (!URL.canParse(a) || !URL.canParse(b)) return false;
 	const origin = new URL(a).origin;
 	return origin !== "null" && origin === new URL(b).origin;
+}
+
+function pageHasOrigin(page: Page, url: string): boolean {
+	return page.frames().some(frame => sameOrigin(frame.url(), url));
 }
 
 /** `replaceable`: worker UAs the patch may overwrite besides the host `HeadlessChrome` one. */
@@ -1274,10 +1278,9 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 				};
 	const next = worker.override ?? stealth;
 	if (next === previous) return;
-	const pageUrl = worker.page.url();
+
 	const expression = workerNavigatorExpression(next, [stealth.userAgent, previous.userAgent]);
-	const refresh = async (session: CDPSession, url: string) => {
-		if (!sameOrigin(pageUrl, url)) return;
+	const refresh = async (session: CDPSession) => {
 		await withSoftTimeout(
 			(async () => {
 				await sendUserAgentOverride(wrapSession(session), next);
@@ -1288,8 +1291,8 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 		);
 	};
 	await Promise.all([
-		...worker.page.workers().map(dedicated => refresh(dedicated.client, dedicated.url())),
-		...[...worker.targets].map(([session, url]) => refresh(session, url)),
+		...worker.page.workers().map(dedicated => refresh(dedicated.client)),
+		...[...worker.targets].filter(([, url]) => pageHasOrigin(worker.page, url)).map(([session]) => refresh(session)),
 	]);
 }
 

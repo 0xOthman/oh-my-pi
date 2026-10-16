@@ -25,6 +25,8 @@ const prelude = createBrowserPrelude(session);
 const context = { session, toolCallId: "browser-stealth-platform-test" };
 let server: Bun.Server<undefined>;
 let pageUrl = "";
+let frameServer: Bun.Server<undefined>;
+let frameUrl = "";
 
 interface ContextIdentity {
 	userAgent: string;
@@ -146,24 +148,25 @@ function expectConsistentIdentity({ page, workers }: NavigatorIdentity): void {
 	});
 }
 
-beforeAll(() => {
-	server = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
-		fetch: request => {
-			if (new URL(request.url).pathname === "/ua") return new Response(request.headers.get("user-agent"));
-			const script = WORKER_SCRIPTS[new URL(request.url).pathname];
-			if (script) return new Response(script, { headers: { "Content-Type": "text/javascript" } });
-			return new Response("<!doctype html><title>platform fixture</title>", {
-				headers: { "Content-Type": "text/html" },
-			});
-		},
+const servePage = (request: Request): Response => {
+	if (new URL(request.url).pathname === "/ua") return new Response(request.headers.get("user-agent"));
+	const script = WORKER_SCRIPTS[new URL(request.url).pathname];
+	if (script) return new Response(script, { headers: { "Content-Type": "text/javascript" } });
+	return new Response("<!doctype html><title>platform fixture</title>", {
+		headers: { "Content-Type": "text/html" },
 	});
+};
+
+beforeAll(() => {
+	server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: servePage });
+	frameServer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: servePage });
 	pageUrl = `http://127.0.0.1:${server.port}/`;
+	frameUrl = `http://127.0.0.1:${frameServer.port}/frame/`;
 });
 
 afterAll(async () => {
 	server?.stop(true);
+	frameServer?.stop(true);
 	await releaseAllTabs({ kill: true });
 	await disposeAllVmContexts();
 });
@@ -310,6 +313,97 @@ return await tab.evaluate(async () => {
 			expect(dedicated).toEqual(page);
 		} finally {
 			await prelude.invoke({ action: "close", name: "platform-dedicated" }, context);
+		}
+	}, 60_000);
+
+	it("keeps running and new cross-origin frame workers aligned after user-agent emulation", async () => {
+		await prelude.invoke({ action: "open", name: "platform-frame", url: pageUrl }, context);
+		try {
+			await runInTab(
+				"platform-frame",
+				`return await tab.evaluate(async () => {
+	const frame = document.createElement("iframe");
+	frame.id = "cross";
+	frame.src = ${JSON.stringify(frameUrl)};
+	const loaded = Promise.withResolvers();
+	frame.onload = loaded.resolve;
+	document.body.append(frame);
+	await loaded.promise;
+	return true;
+});`,
+			);
+			await runInTab(
+				"platform-frame",
+				`return await (await tab.frame("#cross")).evaluate(async () => {
+	window.frameWorker = new Worker("/device-worker.js");
+	const worker = Promise.withResolvers();
+	window.frameWorker.onmessage = event => worker.resolve(event.data);
+	window.frameWorker.postMessage("report");
+	const shared = Promise.withResolvers();
+	const port = new SharedWorker("/device-shared.js", { name: "frame-shared" }).port;
+	port.onmessage = event => shared.resolve(event.data);
+	port.start();
+	window.frameRegistration = await navigator.serviceWorker.register("/device-sw.js", { scope: "/frame/" });
+	const installing = window.frameRegistration.installing;
+	if (installing && installing.state !== "activated") {
+		await new Promise(resolve => installing.addEventListener("statechange", () => {
+			if (installing.state === "activated") resolve();
+		}));
+	}
+	await Promise.all([worker.promise, shared.promise]);
+	return true;
+});`,
+			);
+			const { page, dedicated, shared, service, newShared, newService } = await runInTab<{
+				page: DeviceIdentity;
+				dedicated: DeviceIdentity;
+				shared: DeviceIdentity;
+				service: DeviceIdentity;
+				newShared: DeviceIdentity;
+				newService: DeviceIdentity;
+			}>(
+				"platform-frame",
+				`await tab.emulate({ userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) FrameBrowser/150.0.0.0 Safari/537.36" });
+const page = await tab.evaluate(${DEVICE_REPORT});
+const frame = await tab.frame("#cross");
+const workers = await frame.evaluate(async () => {
+	const dedicated = Promise.withResolvers();
+	window.frameWorker.onmessage = event => dedicated.resolve(event.data);
+	window.frameWorker.postMessage("report");
+	const shared = Promise.withResolvers();
+	const port = new SharedWorker("/device-shared.js", { name: "frame-shared" }).port;
+	port.onmessage = event => shared.resolve(event.data);
+	port.start();
+	const service = Promise.withResolvers();
+	navigator.serviceWorker.onmessage = event => service.resolve(event.data);
+	window.frameRegistration.active.postMessage("report");
+	const existing = { dedicated: await dedicated.promise, shared: await shared.promise, service: await service.promise };
+	const newShared = Promise.withResolvers();
+	const newPort = new SharedWorker("/device-shared.js", { name: "frame-fresh" }).port;
+	newPort.onmessage = event => newShared.resolve(event.data);
+	newPort.start();
+	const registration = await navigator.serviceWorker.register("/device-sw.js?fresh", { scope: "/frame/fresh/" });
+	const installing = registration.installing;
+	if (installing && installing.state !== "activated") {
+		await new Promise(resolve => installing.addEventListener("statechange", () => {
+			if (installing.state === "activated") resolve();
+		}));
+	}
+	const newService = Promise.withResolvers();
+	navigator.serviceWorker.onmessage = event => newService.resolve(event.data);
+	registration.active.postMessage("report");
+	return { ...existing, newShared: await newShared.promise, newService: await newService.promise };
+});
+return { page, ...workers };`,
+			);
+			expect(page.userAgent).toContain("FrameBrowser");
+			expect(dedicated).toEqual(page);
+			expect(shared).toEqual(page);
+			expect(service).toEqual(page);
+			expect(newShared).toEqual(page);
+			expect(newService).toEqual(page);
+		} finally {
+			await prelude.invoke({ action: "close", name: "platform-frame" }, context);
 		}
 	}, 60_000);
 
