@@ -913,6 +913,8 @@ export interface UserAgentSession {
 		page: Page;
 		nativePlatform: string;
 		override: UserAgentOverride | null;
+		/** Attached shared/service-worker sessions and their script URLs, for emulation refreshes. */
+		targets: Map<CDPSession, string>;
 	};
 }
 
@@ -925,6 +927,7 @@ async function configureUserAgentTargets(
 	if (!state.browserSession) {
 		state.browserSession = await browser.target().createCDPSession();
 		patchWorkersBeforeStart(state.browserSession, state);
+		state.browserSession.connection()?.on("sessiondetached", session => state.worker?.targets.delete(session));
 		state.browserSession.on(
 			"Target.attachedToTarget",
 			async (event: { sessionId: string; targetInfo?: { type?: string; url?: string } }) => {
@@ -935,25 +938,17 @@ async function configureUserAgentTargets(
 				try {
 					if (!type || !USER_AGENT_WORKER_TARGET_TYPES[type]) return;
 					const worker = state.worker;
-					const workerOverride = worker?.override;
-					const pageUrl = worker?.page.url();
-					const targetUrl = event.targetInfo?.url;
-					const sameOrigin = Boolean(
-						pageUrl &&
-						targetUrl &&
-						URL.canParse(pageUrl) &&
-						URL.canParse(targetUrl) &&
-						new URL(pageUrl).origin === new URL(targetUrl).origin,
-					);
-					// Only the tab at this origin supplies the worker's request identity.
-					if (worker && !sameOrigin) return;
-					const deviceWorker = Boolean(workerOverride && sameOrigin);
-					const override = deviceWorker && workerOverride ? workerOverride : state.override;
+					const url = event.targetInfo?.url ?? "";
+					worker?.targets.set(session, url);
+					const tabOverride = worker && sameOrigin(worker.page.url(), url) ? worker.override : null;
+					// An emulating tab leaves other origins' workers to the tabs at those origins.
+					if (worker?.override && !tabOverride) return;
+					const override = tabOverride ?? state.override;
 					const applied = sendUserAgentOverride(wrapSession(session), override, { queueBeforeStart: true });
-					if (deviceWorker && workerOverride) {
+					if (tabOverride) {
 						session
 							.send("Runtime.evaluate", {
-								expression: workerNavigatorExpression(state.override, workerOverride),
+								expression: workerNavigatorExpression(tabOverride, [state.override.userAgent]),
 							})
 							.catch(() => undefined);
 					}
@@ -990,12 +985,19 @@ function targetInfoSupportsUserAgentOverride(targetInfo: { type?: string } | und
 	return Boolean(targetInfo?.type && USER_AGENT_TARGET_TYPES.has(targetInfo.type));
 }
 
-function workerNavigatorExpression(stealth: UserAgentOverride, override: UserAgentOverride): string {
+function sameOrigin(a: string, b: string): boolean {
+	if (!URL.canParse(a) || !URL.canParse(b)) return false;
+	const origin = new URL(a).origin;
+	return origin !== "null" && origin === new URL(b).origin;
+}
+
+/** `replaceable`: worker UAs the patch may overwrite besides the host `HeadlessChrome` one. */
+function workerNavigatorExpression(override: UserAgentOverride, replaceable: string[]): string {
 	const identity = {
 		userAgent: override.userAgent,
 		platform: override.platform,
 		uaData: override.userAgentMetadata,
-		stealthUserAgent: stealth.userAgent,
+		replaceable,
 	};
 	return `(${stealthWorkerNavigatorScript})(${JSON.stringify(identity)})`;
 }
@@ -1009,7 +1011,7 @@ function patchWorkersBeforeStart(
 	browserSession: CDPSession,
 	state: UserAgentSession & { override: UserAgentOverride },
 ): void {
-	const expression = workerNavigatorExpression(state.override, state.override);
+	const expression = workerNavigatorExpression(state.override, [state.override.userAgent]);
 	browserSession.connection()?.on("sessionattached", session => {
 		// Device-emulated workers are patched in Target.attachedToTarget, where the
 		// target type and origin are known; evaluating on a device page can crash it.
@@ -1189,7 +1191,12 @@ export async function applyStealthPatches(browser: Browser, page: Page, state: U
 	if (!state.override) {
 		state.override = await resolveUserAgentOverride(page);
 	}
-	state.worker ??= { page, nativePlatform: await page.evaluate(() => navigator.platform), override: null };
+	state.worker ??= {
+		page,
+		nativePlatform: await page.evaluate(() => navigator.platform),
+		override: null,
+		targets: new Map(),
+	};
 	state.worker.page = page;
 	// UA/language overrides are session-scoped; detached target sessions do not
 	// replace the primary client override, and setUserAgent has no language option.
@@ -1203,10 +1210,14 @@ export async function applyStealthPatches(browser: Browser, page: Page, state: U
 	await injectStealthScripts(page);
 }
 
-/** Keep new browser-level workers aligned with the active page after device or UA emulation. */
+/**
+ * Align browser-level workers with the active page after device or UA emulation: new
+ * ones through the `Target.attachedToTarget` handler, running ones at the page's origin here.
+ */
 export async function refreshStealthWorkerIdentity(state: UserAgentSession): Promise<void> {
 	const worker = state.worker;
-	if (!worker || !state.override) return;
+	const stealth = state.override;
+	if (!worker || !stealth) return;
 	const active = await worker.page.evaluate(async () => {
 		const data: UserAgentClientHints | undefined = Reflect.get(navigator, "userAgentData");
 		const hints = await data?.getHighEntropyValues([
@@ -1225,26 +1236,40 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 			hints,
 		};
 	});
-	if (active.userAgent === state.override.userAgent) {
-		worker.override = null;
-		return;
-	}
-	worker.override = {
-		...state.override,
-		userAgent: active.userAgent,
-		platform: worker.nativePlatform,
-		userAgentMetadata: {
-			brands: active.brands,
-			fullVersion: active.hints?.uaFullVersion ?? "",
-			fullVersionList: active.hints?.fullVersionList ?? [],
-			platform: active.platform,
-			platformVersion: active.hints?.platformVersion ?? "",
-			architecture: active.hints?.architecture ?? "",
-			bitness: active.hints?.bitness ?? "",
-			model: active.hints?.model ?? "",
-			mobile: active.mobile,
-		},
-	};
+	const previous = worker.override ?? stealth;
+	worker.override =
+		active.userAgent === stealth.userAgent
+			? null
+			: {
+					...stealth,
+					userAgent: active.userAgent,
+					platform: worker.nativePlatform,
+					userAgentMetadata: {
+						brands: active.brands,
+						fullVersion: active.hints?.uaFullVersion ?? "",
+						fullVersionList: active.hints?.fullVersionList ?? [],
+						platform: active.platform,
+						platformVersion: active.hints?.platformVersion ?? "",
+						architecture: active.hints?.architecture ?? "",
+						bitness: active.hints?.bitness ?? "",
+						model: active.hints?.model ?? "",
+						mobile: active.mobile,
+					},
+				};
+	const next = worker.override ?? stealth;
+	if (next === previous) return;
+	const pageUrl = worker.page.url();
+	const expression = workerNavigatorExpression(next, [stealth.userAgent, previous.userAgent]);
+	await Promise.all(
+		[...worker.targets].map(async ([session, url]) => {
+			if (!sameOrigin(pageUrl, url)) return;
+			const applied = Promise.all([
+				sendUserAgentOverride(wrapSession(session), next),
+				session.send("Runtime.evaluate", { expression }).catch(() => undefined),
+			]);
+			await withSoftTimeout(applied, USER_AGENT_TARGET_TIMEOUT_MS, "worker user-agent refresh");
+		}),
+	);
 }
 
 /** Exposes executable candidates for detection tests. */

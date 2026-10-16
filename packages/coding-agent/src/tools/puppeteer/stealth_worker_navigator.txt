@@ -1,9 +1,10 @@
 // Evaluated over CDP in every new worker realm before its script runs (see
-// patchWorkersBeforeStart in launch.ts). Dedicated workers inherit the page's UA
-// override but keep the host `navigator.platform`; shared and service workers keep
-// the host `HeadlessChrome` UA and UA-CH until the browser-side override reaches
-// them. `identity` is the active tab's UA override; the CDP target handler
-// scopes device overrides to the tab's origin before evaluating this script.
+// patchWorkersBeforeStart in launch.ts), and again in running shared/service workers
+// when their tab's emulation changes (refreshStealthWorkerIdentity). Dedicated workers
+// inherit the page's UA override but keep the host `navigator.platform`; shared and
+// service workers keep the host `HeadlessChrome` UA and UA-CH until the browser-side
+// override reaches them. `identity` is the active tab's UA override; `replaceable`
+// lists the UAs this script may overwrite (stealth, plus a refresh's previous one).
 identity => {
 	if (typeof WorkerGlobalScope === "undefined" || !(self instanceof WorkerGlobalScope)) return;
 	const nav = self.navigator;
@@ -59,13 +60,14 @@ identity => {
 		patched = true;
 	};
 
-	// Nothing is patched yet, so these reads see the realm's native identity.
+	// A first evaluation reads the realm's native identity; a refresh reads the one the
+	// previous evaluation installed, which `identity.replaceable` lists.
 	const nativeUserAgent = String(nav.userAgent);
-	if (
-		!nativeUserAgent.includes("HeadlessChrome/") &&
-		nativeUserAgent !== identity.stealthUserAgent &&
-		nativeUserAgent !== identity.userAgent
-	) return;
+	let replaceable = nativeUserAgent.includes("HeadlessChrome/") || nativeUserAgent === identity.userAgent;
+	for (let i = 0; !replaceable && i < identity.replaceable.length; i++) {
+		replaceable = nativeUserAgent === identity.replaceable[i];
+	}
+	if (!replaceable) return;
 	const replaceGetter = (target, prop, value) =>
 		patch(target, prop, "get", (native, receiver) => {
 			Reflect_apply(native, receiver, []);

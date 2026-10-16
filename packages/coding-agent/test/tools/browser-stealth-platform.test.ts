@@ -235,4 +235,50 @@ return await tab.evaluate(async () => {
 			await prelude.invoke({ action: "close", name: "platform-device" }, context);
 		}
 	}, 60_000);
+
+	// Shared and service workers outlive the emulation call that changes their page's
+	// identity; ones started before `tab.emulate` must follow it.
+	it("moves running shared and service workers to the identity a later emulation sets", async () => {
+		await prelude.invoke({ action: "open", name: "platform-late", url: `${pageUrl}late/` }, context);
+		try {
+			await runInTab(
+				"platform-late",
+				`return await tab.evaluate(async () => {
+	const port = new SharedWorker("/device-shared.js", { name: "late-shared" }).port;
+	const started = Promise.withResolvers();
+	port.onmessage = event => started.resolve(event.data);
+	port.start();
+	await started.promise;
+	await navigator.serviceWorker.register("/device-sw.js", { scope: "/late/" });
+	await navigator.serviceWorker.ready;
+	return true;
+});`,
+			);
+			const { page, shared, service } = await runInTab<{
+				page: DeviceIdentity;
+				shared: DeviceIdentity;
+				service: DeviceIdentity;
+			}>(
+				"platform-late",
+				`await tab.emulate({ device: "iPhone 14" });
+return await tab.evaluate(async () => {
+	const sharedReport = Promise.withResolvers();
+	const port = new SharedWorker("/device-shared.js", { name: "late-shared" }).port;
+	port.onmessage = event => sharedReport.resolve(event.data);
+	port.start();
+	const registration = await navigator.serviceWorker.ready;
+	const serviceReport = Promise.withResolvers();
+	navigator.serviceWorker.onmessage = event => serviceReport.resolve(event.data);
+	registration.active.postMessage("report");
+	const page = await (${DEVICE_REPORT})();
+	return { page, shared: await sharedReport.promise, service: await serviceReport.promise };
+});`,
+			);
+			expect(page.userAgent).toContain("iPhone");
+			expect(shared).toEqual(page);
+			expect(service).toEqual(page);
+		} finally {
+			await prelude.invoke({ action: "close", name: "platform-late" }, context);
+		}
+	}, 60_000);
 });
