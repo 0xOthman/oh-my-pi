@@ -1,3 +1,4 @@
+import { $ } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -106,6 +107,27 @@ describe("read tool directory listings honor line selectors (regression: was sil
 		expect(expanded).toContain("c-40.txt");
 		expect(expanded).not.toContain("more");
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"lists sockets and FIFOs instead of treating a nonempty directory as empty",
+		async () => {
+			const child = path.join(testDir, "special");
+			fs.mkdirSync(child);
+			const server = Bun.listen({ unix: path.join(child, "SingletonSocket"), socket: { data() {} } });
+			try {
+				await $`mkfifo ${path.join(child, "SomeFifo")}`;
+				const output = getTextOutput(await tool.execute("call-special", { path: child }));
+				expect(output).toMatch(/- SingletonSocket \[socket\]/);
+				expect(output).toMatch(/- SomeFifo \[FIFO\]/);
+
+				const parent = getTextOutput(await tool.execute("call-parent", { path: testDir }));
+				expect(parent).toMatch(/- SingletonSocket \[socket\]/);
+				expect(parent).toMatch(/- SomeFifo \[FIFO\]/);
+			} finally {
+				server.stop(true);
+			}
+		},
+	);
 
 	it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
 		"reports an unreadable root instead of claiming its files are absent",

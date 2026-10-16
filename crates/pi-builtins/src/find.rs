@@ -366,7 +366,11 @@ pub mod matchers {
 					self.known_type = match file_type {
 						pi_walker::FileType::File => Some(FileType::Regular),
 						pi_walker::FileType::Dir => Some(FileType::Directory),
-						pi_walker::FileType::Symlink => None,
+						pi_walker::FileType::Symlink
+						| pi_walker::FileType::Socket
+						| pi_walker::FileType::Fifo
+						| pi_walker::FileType::CharacterDevice
+						| pi_walker::FileType::BlockDevice => None,
 					};
 				}
 				self

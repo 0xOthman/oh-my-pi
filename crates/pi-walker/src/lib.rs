@@ -55,6 +55,20 @@ pub enum FileType {
 	Dir,
 	/// Symbolic link.
 	Symlink,
+	/// Unix-domain socket.
+	Socket,
+	/// Named pipe.
+	Fifo,
+	/// Character device.
+	CharacterDevice,
+	/// Block device.
+	BlockDevice,
+}
+
+impl FileType {
+	const fn is_special(self) -> bool {
+		matches!(self, Self::Socket | Self::Fifo | Self::CharacterDevice | Self::BlockDevice)
+	}
 }
 
 /// Amount of metadata to collect while reading directories.
@@ -570,41 +584,43 @@ pub struct WalkOutcome {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WalkOptions {
 	/// Include dot-prefixed entries.
-	pub include_hidden:      bool,
+	pub include_hidden:        bool,
+	/// Include sockets, FIFOs, and device nodes (default: false).
+	pub include_special_files: bool,
 	/// Honor `.ignore`, `.gitignore`, repository excludes, and global gitignore.
-	pub use_gitignore:       bool,
+	pub use_gitignore:         bool,
 	/// Prune `.git` directories during traversal.
-	pub skip_git:            bool,
+	pub skip_git:              bool,
 	/// Prune `node_modules` directories during traversal.
-	pub skip_node_modules:   bool,
+	pub skip_node_modules:     bool,
 	/// Symbolic-link traversal policy.
-	pub follow_links:        FollowLinks,
+	pub follow_links:          FollowLinks,
 	/// Metadata detail requested for each yielded entry.
-	pub detail:              WalkDetail,
+	pub detail:                WalkDetail,
 	/// Deepest entry depth that receives `detail`; deeper entries are listed
 	/// with [`WalkDetail::Minimal`] so callers that only need names past a
 	/// depth skip per-entry metadata syscalls there.
-	pub detail_max_depth:    usize,
+	pub detail_max_depth:      usize,
 	/// File (or symlink) name exempt from ignore-file matching, so callers can
 	/// find a well-known file even when a file-level rule ignores it. Ignored
 	/// directories are still pruned.
-	pub unignored_file_name: Option<&'static str>,
+	pub unignored_file_name:   Option<&'static str>,
 	/// Per-directory visit order.
-	pub order:               WalkOrder,
+	pub order:                 WalkOrder,
 	/// Yield the traversal root as a depth-0 entry before its children.
-	pub emit_root:           bool,
+	pub emit_root:             bool,
 	/// Minimum depth yielded to the visitor. Root depth is 0.
-	pub min_depth:           usize,
+	pub min_depth:             usize,
 	/// Maximum depth traversed and yielded. Root depth is 0.
-	pub max_depth:           usize,
+	pub max_depth:             usize,
 	/// Yield directory entries after their children.
-	pub contents_first:      bool,
+	pub contents_first:        bool,
 	/// Directory-open error handling policy.
-	pub directory_errors:    DirectoryErrorMode,
+	pub directory_errors:      DirectoryErrorMode,
 	/// Stay on the root filesystem when supported by the platform.
-	pub same_file_system:    bool,
+	pub same_file_system:      bool,
 	/// Use the shared scan cache when collecting owned entries.
-	pub cache:               bool,
+	pub cache:                 bool,
 }
 
 impl WalkOptions {
@@ -629,22 +645,23 @@ impl WalkOptions {
 impl Default for WalkOptions {
 	fn default() -> Self {
 		Self {
-			include_hidden:      true,
-			use_gitignore:       false,
-			skip_git:            false,
-			skip_node_modules:   false,
-			follow_links:        FollowLinks::Never,
-			detail:              WalkDetail::Minimal,
-			detail_max_depth:    usize::MAX,
-			unignored_file_name: None,
-			order:               WalkOrder::Path,
-			emit_root:           false,
-			min_depth:           1,
-			max_depth:           usize::MAX,
-			contents_first:      false,
-			directory_errors:    DirectoryErrorMode::Visit,
-			same_file_system:    false,
-			cache:               false,
+			include_hidden:        true,
+			include_special_files: false,
+			use_gitignore:         false,
+			skip_git:              false,
+			skip_node_modules:     false,
+			follow_links:          FollowLinks::Never,
+			detail:                WalkDetail::Minimal,
+			detail_max_depth:      usize::MAX,
+			unignored_file_name:   None,
+			order:                 WalkOrder::Path,
+			emit_root:             false,
+			min_depth:             1,
+			max_depth:             usize::MAX,
+			contents_first:        false,
+			directory_errors:      DirectoryErrorMode::Visit,
+			same_file_system:      false,
+			cache:                 false,
 		}
 	}
 }
@@ -738,6 +755,12 @@ impl WalkRequest {
 	/// Include or exclude dot-prefixed entries.
 	pub const fn hidden(mut self, include_hidden: bool) -> Self {
 		self.options.include_hidden = include_hidden;
+		self
+	}
+
+	/// Include sockets, FIFOs, and device nodes in this request only.
+	pub const fn special_files(mut self, include_special_files: bool) -> Self {
+		self.options.include_special_files = include_special_files;
 		self
 	}
 
@@ -1699,6 +1722,7 @@ fn walk_parallel_dir<'scope, E, S, H>(
 		&context.fs,
 		&dir,
 		context.options.listing_detail(depth),
+		context.options.include_special_files,
 		&mut scratch,
 		&context.matcher,
 		derive_ignore_from_entries,
@@ -2599,16 +2623,18 @@ fn file_type_from_metadata(metadata: &pi_vfs::Metadata) -> Option<FileType> {
 	walker_file_type(metadata.file_type())
 }
 
-/// Map a filesystem entry type to the walker kinds, skipping special files.
-fn walker_file_type(file_type: pi_vfs::FileType) -> Option<FileType> {
-	if file_type.is_symlink() {
-		Some(FileType::Symlink)
-	} else if file_type.is_dir() {
-		Some(FileType::Dir)
-	} else if file_type.is_file() {
-		Some(FileType::File)
-	} else {
-		None
+/// Map VFS entry kinds to walker kinds; readers apply the special-file policy.
+const fn walker_file_type(file_type: pi_vfs::FileType) -> Option<FileType> {
+	use pi_vfs::FileKind;
+	match file_type.kind() {
+		FileKind::File => Some(FileType::File),
+		FileKind::Dir => Some(FileType::Dir),
+		FileKind::Symlink => Some(FileType::Symlink),
+		FileKind::Socket => Some(FileType::Socket),
+		FileKind::Fifo => Some(FileType::Fifo),
+		FileKind::CharDevice => Some(FileType::CharacterDevice),
+		FileKind::BlockDevice => Some(FileType::BlockDevice),
+		FileKind::Unknown => None,
 	}
 }
 
@@ -2806,7 +2832,9 @@ impl<H> WalkContext<'_, H> {
 		H: FnMut() -> std::result::Result<(), V::Error>,
 	{
 		let root_entry = root_entry(self.fs, root, self.options.detail, self.options.follow_links)?;
-		let Some(root_entry) = root_entry else {
+		let Some(root_entry) = root_entry
+			.filter(|entry| self.options.include_special_files || !entry.file_type.is_special())
+		else {
 			return Ok(WalkStatus::Complete);
 		};
 
@@ -2951,6 +2979,7 @@ impl<H> WalkContext<'_, H> {
 			self.fs,
 			&self.absolute_path,
 			self.options.listing_detail(depth),
+			self.options.include_special_files,
 			&mut scratch,
 			&self.matcher,
 			derive_ignore_from_entries,
@@ -3058,7 +3087,9 @@ impl<H> WalkContext<'_, H> {
 		};
 
 		if let Some(target_metadata) = followed_metadata.as_ref() {
-			let Some(target_file_type) = file_type_from_metadata(target_metadata) else {
+			let Some(target_file_type) = file_type_from_metadata(target_metadata)
+				.filter(|kind| self.options.include_special_files || !kind.is_special())
+			else {
 				return Ok(false);
 			};
 			file_type = target_file_type;
@@ -3205,6 +3236,7 @@ fn collect_directory_entries<E>(
 	fs: &BlockingFs,
 	dir: &Path,
 	detail: WalkDetail,
+	include_special_files: bool,
 	scratch: &mut DirScratch,
 	matcher: &FastIgnore,
 	derive_ignore_from_entries: bool,
@@ -3222,9 +3254,9 @@ fn collect_directory_entries<E>(
 			Ok(ReadDirControl::Continue)
 		};
 		if fs.is_native_local(dir) {
-			platform::read_dir_entries(dir, detail, &mut read_buffer, emit)
+			platform::read_dir_entries(dir, detail, include_special_files, &mut read_buffer, emit)
 		} else {
-			read_dir_entries_in(fs, dir, detail, emit)
+			read_dir_entries_in(fs, dir, detail, include_special_files, emit)
 		}
 	};
 	scratch.read_buffer = read_buffer;
@@ -3234,14 +3266,15 @@ fn collect_directory_entries<E>(
 
 /// Read one directory through an injected filesystem provider.
 ///
-/// Mirrors the platform readers: special files are skipped, and entries that
-/// disappear or become unreadable between the listing and their metadata lookup
-/// are skipped like native scan races. Entry names that are not a single path
-/// component and all other listing or metadata errors are returned.
+/// Mirrors the platform readers: special files are opt-in, and entries that
+/// disappear or become unreadable between listing and metadata lookup are
+/// skipped like native scan races. Invalid entry names and other errors are
+/// returned.
 fn read_dir_entries_in<F, E>(
 	fs: &BlockingFs,
 	path: &Path,
 	detail: WalkDetail,
+	include_special_files: bool,
 	mut emit: F,
 ) -> std::result::Result<ReadDirControl, ReadDirError<E>>
 where
@@ -3261,7 +3294,9 @@ where
 			Err(err) if is_skippable_entry_error(&err) => continue,
 			Err(err) => return Err(err.into()),
 		};
-		let Some(file_type) = walker_file_type(file_type) else {
+		let Some(file_type) =
+			walker_file_type(file_type).filter(|kind| include_special_files || !kind.is_special())
+		else {
 			continue;
 		};
 		let (mtime, size) = if detail == WalkDetail::Full {
@@ -3990,7 +4025,10 @@ mod platform {
 		ffi::{CString, OsStr},
 		io,
 		mem::size_of,
-		os::{fd::RawFd, unix::ffi::OsStrExt},
+		os::{
+			fd::RawFd,
+			unix::{ffi::OsStrExt, fs::FileTypeExt},
+		},
 		path::Path,
 	};
 
@@ -4009,7 +4047,11 @@ mod platform {
 	const REQUIRED_COMMON_ATTRS: libc::attrgroup_t = libc::ATTR_CMN_NAME | libc::ATTR_CMN_OBJTYPE;
 	const VREG: u32 = 1;
 	const VDIR: u32 = 2;
+	const VBLK: u32 = 3;
+	const VCHR: u32 = 4;
 	const VLNK: u32 = 5;
+	const VSOCK: u32 = 6;
+	const VFIFO: u32 = 7;
 
 	struct FdGuard(RawFd);
 
@@ -4057,6 +4099,7 @@ mod platform {
 	pub fn read_dir_entries<F, E>(
 		path: &Path,
 		detail: WalkDetail,
+		include_special_files: bool,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
@@ -4064,10 +4107,13 @@ mod platform {
 		F: FnMut(RawDirEntry<'_>) -> std::result::Result<ReadDirControl, WalkError<E>>,
 	{
 		if detail == WalkDetail::Minimal {
-			return read_dirent_entries(path, emit);
+			return read_dirent_entries(path, include_special_files, emit);
 		}
 		let mut emitted = false;
 		let result = read_bulk_entries(path, buffer, |entry| {
+			if !include_special_files && entry.file_type.is_special() {
+				return Ok(ReadDirControl::Continue);
+			}
 			emitted = true;
 			emit(entry)
 		});
@@ -4075,7 +4121,7 @@ mod platform {
 			// Fall back only before any entry was emitted, so a late failure
 			// cannot deliver entries twice.
 			Err(ReadDirError::Io(err)) if !emitted && is_unsupported_dir_scan(&err) => {
-				read_dir_entries_std(path, detail, emit)
+				read_dir_entries_std(path, detail, include_special_files, emit)
 			},
 			result => result,
 		}
@@ -4083,6 +4129,7 @@ mod platform {
 
 	fn read_dirent_entries<F, E>(
 		path: &Path,
+		include_special_files: bool,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
 	where
@@ -4116,6 +4163,10 @@ mod platform {
 				libc::DT_REG => FileType::File,
 				libc::DT_DIR => FileType::Dir,
 				libc::DT_LNK => FileType::Symlink,
+				libc::DT_SOCK => FileType::Socket,
+				libc::DT_FIFO => FileType::Fifo,
+				libc::DT_CHR => FileType::CharacterDevice,
+				libc::DT_BLK => FileType::BlockDevice,
 				libc::DT_UNKNOWN => match stat_file_type(&dir, entry) {
 					Ok(Some(file_type)) => file_type,
 					Ok(None) => continue,
@@ -4124,6 +4175,9 @@ mod platform {
 				},
 				_ => continue,
 			};
+			if !include_special_files && file_type.is_special() {
+				continue;
+			}
 			let raw_entry = RawDirEntry {
 				name: OsStr::from_bytes(name).into(),
 				file_type,
@@ -4157,6 +4211,10 @@ mod platform {
 			libc::S_IFREG => Some(FileType::File),
 			libc::S_IFDIR => Some(FileType::Dir),
 			libc::S_IFLNK => Some(FileType::Symlink),
+			libc::S_IFSOCK => Some(FileType::Socket),
+			libc::S_IFIFO => Some(FileType::Fifo),
+			libc::S_IFCHR => Some(FileType::CharacterDevice),
+			libc::S_IFBLK => Some(FileType::BlockDevice),
 			_ => None,
 		})
 	}
@@ -4243,6 +4301,7 @@ mod platform {
 	fn read_dir_entries_std<F, E>(
 		path: &Path,
 		detail: WalkDetail,
+		include_special_files: bool,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
 	where
@@ -4262,10 +4321,19 @@ mod platform {
 				Some(FileType::Dir)
 			} else if file_type.is_file() {
 				Some(FileType::File)
+			} else if file_type.is_socket() {
+				Some(FileType::Socket)
+			} else if file_type.is_fifo() {
+				Some(FileType::Fifo)
+			} else if file_type.is_char_device() {
+				Some(FileType::CharacterDevice)
+			} else if file_type.is_block_device() {
+				Some(FileType::BlockDevice)
 			} else {
 				None
 			};
-			let Some(file_type) = file_type else {
+			let Some(file_type) = file_type.filter(|kind| include_special_files || !kind.is_special())
+			else {
 				continue;
 			};
 
@@ -4390,6 +4458,10 @@ mod platform {
 			VREG => Some(FileType::File),
 			VDIR => Some(FileType::Dir),
 			VLNK => Some(FileType::Symlink),
+			VSOCK => Some(FileType::Socket),
+			VFIFO => Some(FileType::Fifo),
+			VCHR => Some(FileType::CharacterDevice),
+			VBLK => Some(FileType::BlockDevice),
 			_ => None,
 		}
 	}
@@ -4486,6 +4558,7 @@ mod platform {
 	pub fn read_dir_entries<F, E>(
 		path: &Path,
 		detail: WalkDetail,
+		include_special_files: bool,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
@@ -4537,6 +4610,9 @@ mod platform {
 				}
 
 				let dtype_file_type = file_type_from_dtype(d_type);
+				if !include_special_files && dtype_file_type.is_some_and(FileType::is_special) {
+					continue;
+				}
 				let stat = if detail == WalkDetail::Full || dtype_file_type.is_none() {
 					match stat_entry(fd.0, name_bytes, detail) {
 						Ok(Some(stat)) => Some(stat),
@@ -4553,6 +4629,9 @@ mod platform {
 				let Some(file_type) = file_type else {
 					continue;
 				};
+				if !include_special_files && file_type.is_special() {
+					continue;
+				}
 				let entry = RawDirEntry {
 					name: OsStr::from_bytes(name_bytes).into(),
 					file_type,
@@ -4701,6 +4780,10 @@ mod platform {
 			libc::DT_REG => Some(FileType::File),
 			libc::DT_DIR => Some(FileType::Dir),
 			libc::DT_LNK => Some(FileType::Symlink),
+			libc::DT_SOCK => Some(FileType::Socket),
+			libc::DT_FIFO => Some(FileType::Fifo),
+			libc::DT_CHR => Some(FileType::CharacterDevice),
+			libc::DT_BLK => Some(FileType::BlockDevice),
 			_ => None,
 		}
 	}
@@ -4710,6 +4793,10 @@ mod platform {
 			libc::S_IFREG => Some(FileType::File),
 			libc::S_IFDIR => Some(FileType::Dir),
 			libc::S_IFLNK => Some(FileType::Symlink),
+			libc::S_IFSOCK => Some(FileType::Socket),
+			libc::S_IFIFO => Some(FileType::Fifo),
+			libc::S_IFCHR => Some(FileType::CharacterDevice),
+			libc::S_IFBLK => Some(FileType::BlockDevice),
 			_ => None,
 		}
 	}
@@ -4772,6 +4859,7 @@ mod platform {
 	pub fn read_dir_entries<F, E>(
 		path: &Path,
 		detail: WalkDetail,
+		_include_special_files: bool,
 		buffer: &mut Vec<u8>,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
@@ -4908,6 +4996,8 @@ mod platform {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 mod platform {
+	#[cfg(unix)]
+	use std::os::unix::fs::FileTypeExt;
 	use std::{borrow::Cow, io, path::Path};
 
 	use super::{FileType, RawDirEntry, ReadDirControl, ReadDirError, WalkDetail, WalkError};
@@ -4917,6 +5007,7 @@ mod platform {
 	pub fn read_dir_entries<F, E>(
 		path: &Path,
 		detail: WalkDetail,
+		include_special_files: bool,
 		_buffer: &mut Vec<u8>,
 		mut emit: F,
 	) -> std::result::Result<ReadDirControl, ReadDirError<E>>
@@ -4939,10 +5030,19 @@ mod platform {
 			} else if file_type.is_file() {
 				Some(FileType::File)
 			} else {
-				None
+				#[cfg(unix)]
+				{
+					unix_special_file_type(&file_type)
+				}
+				#[cfg(not(unix))]
+				{
+					None
+				}
 			};
-			let Some(custom_file_type) = custom_file_type else {
-				continue; // skip unsupported special files
+			let Some(custom_file_type) =
+				custom_file_type.filter(|kind| include_special_files || !kind.is_special())
+			else {
+				continue;
 			};
 
 			let mut mtime = None;
@@ -4976,6 +5076,21 @@ mod platform {
 			}
 		}
 		Ok(ReadDirControl::Continue)
+	}
+
+	#[cfg(unix)]
+	fn unix_special_file_type(file_type: &std::fs::FileType) -> Option<FileType> {
+		if file_type.is_socket() {
+			Some(FileType::Socket)
+		} else if file_type.is_fifo() {
+			Some(FileType::Fifo)
+		} else if file_type.is_char_device() {
+			Some(FileType::CharacterDevice)
+		} else if file_type.is_block_device() {
+			Some(FileType::BlockDevice)
+		} else {
+			None
+		}
 	}
 
 	fn is_skippable_entry_error(err: &io::Error) -> bool {
@@ -5045,22 +5160,23 @@ mod tests {
 
 	fn test_options() -> WalkOptions {
 		WalkOptions {
-			include_hidden:      true,
-			use_gitignore:       false,
-			skip_git:            true,
-			skip_node_modules:   true,
-			follow_links:        FollowLinks::Never,
-			detail:              WalkDetail::Minimal,
-			detail_max_depth:    usize::MAX,
-			unignored_file_name: None,
-			order:               WalkOrder::Path,
-			emit_root:           false,
-			min_depth:           1,
-			max_depth:           usize::MAX,
-			contents_first:      false,
-			directory_errors:    DirectoryErrorMode::SkipSkippable,
-			same_file_system:    false,
-			cache:               false,
+			include_hidden:        true,
+			include_special_files: false,
+			use_gitignore:         false,
+			skip_git:              true,
+			skip_node_modules:     true,
+			follow_links:          FollowLinks::Never,
+			detail:                WalkDetail::Minimal,
+			detail_max_depth:      usize::MAX,
+			unignored_file_name:   None,
+			order:                 WalkOrder::Path,
+			emit_root:             false,
+			min_depth:             1,
+			max_depth:             usize::MAX,
+			contents_first:        false,
+			directory_errors:      DirectoryErrorMode::SkipSkippable,
+			same_file_system:      false,
+			cache:                 false,
 		}
 	}
 

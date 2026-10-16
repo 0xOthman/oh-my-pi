@@ -65,6 +65,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		hidden: true,
 		gitignore: false,
 		reportDirectoryErrors: true,
+		includeSpecialFiles: true,
 	});
 
 	return assembleTree(rootPath, result.entries, {
@@ -124,6 +125,7 @@ export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTre
 
 interface Node {
 	name: string;
+	fileType: FileType;
 	isDir: boolean;
 	mtimeMs: number;
 	size: number;
@@ -192,6 +194,7 @@ function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: Ass
 		const name = slash === -1 ? entry.path : entry.path.slice(slash + 1);
 		const parentPath = slash === -1 ? "" : entry.path.slice(0, slash);
 		const node: Node = {
+			fileType: entry.fileType,
 			name,
 			isDir: entry.fileType === FileType.Dir,
 			mtimeMs: entry.mtime ?? 0,
@@ -208,6 +211,7 @@ function assembleTree(rootPath: string, entries: readonly GlobMatch[], opts: Ass
 
 	const root: Node = {
 		name: ".",
+		fileType: FileType.Dir,
 		isDir: true,
 		mtimeMs: 0,
 		size: 0,
@@ -277,6 +281,21 @@ function formatMtimeStable(mtimeMs: number): string {
 	return new Date(mtimeMs).toISOString().slice(0, 16).replace("T", " ");
 }
 
+function specialFileType(fileType: FileType): string | undefined {
+	switch (fileType) {
+		case FileType.Socket:
+			return "socket";
+		case FileType.Fifo:
+			return "FIFO";
+		case FileType.CharacterDevice:
+			return "character device";
+		case FileType.BlockDevice:
+			return "block device";
+		default:
+			return undefined;
+	}
+}
+
 function renderNode(node: Node, formatNodeAge: (mtimeMs: number) => string, out: RenderedLine[]): void {
 	if (node.depth === 0) {
 		out.push({ label: node.name, depth: 0, isRoot: true });
@@ -284,11 +303,12 @@ function renderNode(node: Node, formatNodeAge: (mtimeMs: number) => string, out:
 		const indent = "  ".repeat(node.depth);
 		const suffix = node.isDir ? "/" : "";
 		const unreadable = node.unreadable ? ` [unreadable: ${node.unreadable}]` : "";
+		const specialType = specialFileType(node.fileType);
 		out.push({
-			label: `${indent}- ${node.name}${suffix}${unreadable}`,
+			label: `${indent}- ${node.name}${suffix}${specialType ? ` [${specialType}]` : ""}${unreadable}`,
 			depth: node.depth,
 			isRoot: false,
-			size: node.isDir ? undefined : formatBytes(node.size),
+			size: node.isDir || specialType ? undefined : formatBytes(node.size),
 			age: formatNodeAge(node.mtimeMs),
 		});
 	}

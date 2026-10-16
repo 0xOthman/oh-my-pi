@@ -131,7 +131,11 @@ fn apply_file_type_filter(
 				None
 			}
 		},
-		FileType::Symlink => None,
+		FileType::Symlink
+		| FileType::Socket
+		| FileType::Fifo
+		| FileType::CharacterDevice
+		| FileType::BlockDevice => None,
 	}
 }
 

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `read` directory listings silently omitting sockets, FIFOs, and devices; special entries now show their type ([#16014](https://github.com/can1357/oh-my-pi/issues/16014)).
+
 ## [18.11.2] - 2026-10-16
 
 ### Added

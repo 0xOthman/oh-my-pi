@@ -1895,7 +1895,15 @@ export declare enum FileType {
   /** Directory. */
   Dir = 2,
   /** Symbolic link. */
-  Symlink = 3
+  Symlink = 3,
+  /** Unix-domain socket. */
+  Socket = 4,
+  /** Named pipe. */
+  Fifo = 5,
+  /** Character device. */
+  CharacterDevice = 6,
+  /** Block device. */
+  BlockDevice = 7
 }
 
 /** Fuzzy file path search for autocomplete. */
@@ -2469,6 +2477,8 @@ export interface ListWorkspaceOptions {
   hidden?: boolean
   /** Respect .gitignore files. Default: true. */
   gitignore?: boolean
+  /** Include sockets, FIFOs, and devices in tree entries. Default: false. */
+  includeSpecialFiles?: boolean
   /**
    * Also surface AGENTS.md files in directories at depth 1..=4, even when
    * gitignore would otherwise hide the file. Walks deeper than `maxDepth`

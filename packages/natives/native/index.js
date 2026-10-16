@@ -186,6 +186,10 @@ export const FileType = {
 	File: 1,
 	Dir: 2,
 	Symlink: 3,
+	Socket: 4,
+	Fifo: 5,
+	CharacterDevice: 6,
+	BlockDevice: 7,
 };
 export const GrepOutputMode = {
 	Content: "content",

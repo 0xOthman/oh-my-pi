@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `listWorkspace({ includeSpecialFiles: true })` to include sockets, FIFOs, and devices in directory scans ([#16014](https://github.com/can1357/oh-my-pi/issues/16014)).
+
 ## [18.11.2] - 2026-10-16
 
 ### Added

@@ -17,11 +17,19 @@ use crate::js;
 #[napi]
 pub enum FileType {
 	/// Regular file.
-	File    = 1,
+	File            = 1,
 	/// Directory.
-	Dir     = 2,
+	Dir             = 2,
 	/// Symbolic link.
-	Symlink = 3,
+	Symlink         = 3,
+	/// Unix-domain socket.
+	Socket          = 4,
+	/// Named pipe.
+	Fifo            = 5,
+	/// Character device.
+	CharacterDevice = 6,
+	/// Block device.
+	BlockDevice     = 7,
 }
 
 /// A single filesystem entry from a directory scan.
@@ -53,6 +61,10 @@ pub(crate) const fn from_walker_file_type(file_type: pi_walker::FileType) -> Fil
 		pi_walker::FileType::File => FileType::File,
 		pi_walker::FileType::Dir => FileType::Dir,
 		pi_walker::FileType::Symlink => FileType::Symlink,
+		pi_walker::FileType::Socket => FileType::Socket,
+		pi_walker::FileType::Fifo => FileType::Fifo,
+		pi_walker::FileType::CharacterDevice => FileType::CharacterDevice,
+		pi_walker::FileType::BlockDevice => FileType::BlockDevice,
 	}
 }
 

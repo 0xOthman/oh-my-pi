@@ -57,6 +57,8 @@ pub struct ListWorkspaceOptions<'env> {
 	pub hidden:                  Option<bool>,
 	/// Respect .gitignore files. Default: true.
 	pub gitignore:               Option<bool>,
+	/// Include sockets, FIFOs, and devices in tree entries. Default: false.
+	pub include_special_files:   Option<bool>,
 	/// Also surface AGENTS.md files in directories at depth 1..=4, even when
 	/// gitignore would otherwise hide the file. Walks deeper than `maxDepth`
 	/// to find them. Default: false.
@@ -101,6 +103,7 @@ struct WorkspaceConfig {
 	max_depth:               usize,
 	walk_max_depth:          usize,
 	include_hidden:          bool,
+	include_special_files:   bool,
 	use_gitignore:           bool,
 	collect_agents_md:       bool,
 	report_directory_errors: bool,
@@ -134,6 +137,7 @@ impl WorkspaceResults {
 fn build_workspace_walk_request(config: &WorkspaceConfig) -> pi_walker::WalkRequest {
 	pi_walker::WalkRequest::new(config.root.clone())
 		.hidden(config.include_hidden)
+		.special_files(config.include_special_files)
 		.gitignore(config.use_gitignore)
 		.skip_git(true)
 		.skip_node_modules(true)
@@ -159,7 +163,11 @@ fn is_file_or_file_symlink(path: &Path, file_type: FileType) -> bool {
 	match file_type {
 		FileType::File => true,
 		FileType::Symlink => std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()),
-		FileType::Dir => false,
+		FileType::Dir
+		| FileType::Socket
+		| FileType::Fifo
+		| FileType::CharacterDevice
+		| FileType::BlockDevice => false,
 	}
 }
 
@@ -281,6 +289,7 @@ pub fn list_workspace(options: ListWorkspaceOptions<'_>) -> task::Promise<ListWo
 		max_depth,
 		hidden,
 		gitignore,
+		include_special_files,
 		collect_agents_md,
 		report_directory_errors,
 		timeout_ms,
@@ -308,6 +317,7 @@ pub fn list_workspace(options: ListWorkspaceOptions<'_>) -> task::Promise<ListWo
 				max_depth,
 				walk_max_depth,
 				include_hidden: hidden.unwrap_or(false),
+				include_special_files: include_special_files.unwrap_or(false),
 				use_gitignore: gitignore.unwrap_or(true),
 				collect_agents_md,
 				report_directory_errors,
@@ -323,6 +333,70 @@ mod tests {
 
 	fn file(path: String) -> GlobMatch {
 		GlobMatch { path, file_type: FileType::File, mtime: None, size: None }
+	}
+	#[cfg(unix)]
+	#[test]
+	fn workspace_special_entries_are_opt_in() {
+		use std::{
+			ffi::CString,
+			os::unix::{ffi::OsStrExt, net::UnixListener},
+			time::{SystemTime, UNIX_EPOCH},
+		};
+
+		struct TempRoot(PathBuf);
+		impl Drop for TempRoot {
+			fn drop(&mut self) {
+				let _ = std::fs::remove_dir_all(&self.0);
+			}
+		}
+
+		let unique = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		// Keep the socket path under SUN_LEN even when TMPDIR is deeply nested.
+		let root =
+			TempRoot(PathBuf::from("/tmp").join(format!("pi-ws-{}-{unique}", std::process::id())));
+		std::fs::create_dir_all(root.0.join("nested")).unwrap();
+		let _socket = UnixListener::bind(root.0.join("nested/socket")).unwrap();
+		let fifo = CString::new(root.0.join("nested/pipe").as_os_str().as_bytes()).unwrap();
+		// SAFETY: `fifo` is a NUL-terminated path, and mkfifo does not retain it.
+		assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+		let scan = |include_special_files| {
+			run_list_workspace(
+				WorkspaceConfig {
+					root: root.0.clone(),
+					max_depth: 2,
+					walk_max_depth: 2,
+					include_hidden: false,
+					include_special_files,
+					use_gitignore: false,
+					collect_agents_md: false,
+					report_directory_errors: false,
+				},
+				task::CancelToken::new(None, None),
+			)
+			.unwrap()
+			.entries
+		};
+
+		let default_entries = scan(false);
+		assert_eq!(default_entries.len(), 1);
+		assert_eq!(default_entries[0].path, "nested");
+		assert_eq!(default_entries[0].file_type, FileType::Dir);
+
+		let entries = scan(true);
+		assert_eq!(entries.len(), 3);
+		assert_eq!(entries[0].path, "nested");
+		assert_eq!(entries[1].path, "nested/pipe");
+		assert_eq!(entries[1].file_type, FileType::Fifo);
+		assert_eq!(entries[2].path, "nested/socket");
+		assert_eq!(entries[2].file_type, FileType::Socket);
+		for entry in &entries[1..] {
+			assert!(entry.mtime.is_some());
+			assert_eq!(entry.size, None);
+		}
 	}
 
 	#[test]
