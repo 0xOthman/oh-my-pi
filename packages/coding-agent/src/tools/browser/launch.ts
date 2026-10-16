@@ -911,7 +911,6 @@ export interface UserAgentSession {
 	browserSession: CDPSession | null;
 	worker?: {
 		page: Page;
-		nativePlatform: string;
 		override: UserAgentOverride | null;
 		/** Attached shared/service-worker sessions and their script URLs, for emulation refreshes. */
 		targets: Map<CDPSession, string>;
@@ -1191,12 +1190,7 @@ export async function applyStealthPatches(browser: Browser, page: Page, state: U
 	if (!state.override) {
 		state.override = await resolveUserAgentOverride(page);
 	}
-	state.worker ??= {
-		page,
-		nativePlatform: await page.evaluate(() => navigator.platform),
-		override: null,
-		targets: new Map(),
-	};
+	state.worker ??= { page, override: null, targets: new Map() };
 	state.worker.page = page;
 	// UA/language overrides are session-scoped; detached target sessions do not
 	// replace the primary client override, and setUserAgent has no language option.
@@ -1211,8 +1205,9 @@ export async function applyStealthPatches(browser: Browser, page: Page, state: U
 }
 
 /**
- * Align browser-level workers with the active page after device or UA emulation: new
- * ones through the `Target.attachedToTarget` handler, running ones at the page's origin here.
+ * Align running workers with the active page after device or UA emulation.
+ * Dedicated workers belong to `page.workers()`; shared/service workers use the
+ * long-lived browser session stored in `worker.targets`.
  */
 export async function refreshStealthWorkerIdentity(state: UserAgentSession): Promise<void> {
 	const worker = state.worker;
@@ -1228,8 +1223,14 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 			"fullVersionList",
 			"uaFullVersion",
 		]);
+		// Mirror the page's stealth platform getter while CDP emulation can briefly expose the host value.
 		return {
 			userAgent: navigator.userAgent,
+			navigatorPlatform: navigator.userAgent.includes("Windows")
+				? "Win32"
+				: navigator.userAgent.includes("Macintosh")
+					? "MacIntel"
+					: navigator.platform,
 			brands: data?.brands ?? [],
 			platform: data?.platform ?? "",
 			mobile: data?.mobile ?? false,
@@ -1243,7 +1244,7 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 			: {
 					...stealth,
 					userAgent: active.userAgent,
-					platform: worker.nativePlatform,
+					platform: active.navigatorPlatform,
 					userAgentMetadata: {
 						brands: active.brands,
 						fullVersion: active.hints?.uaFullVersion ?? "",
@@ -1260,16 +1261,21 @@ export async function refreshStealthWorkerIdentity(state: UserAgentSession): Pro
 	if (next === previous) return;
 	const pageUrl = worker.page.url();
 	const expression = workerNavigatorExpression(next, [stealth.userAgent, previous.userAgent]);
-	await Promise.all(
-		[...worker.targets].map(async ([session, url]) => {
-			if (!sameOrigin(pageUrl, url)) return;
-			const applied = Promise.all([
-				sendUserAgentOverride(wrapSession(session), next),
-				session.send("Runtime.evaluate", { expression }).catch(() => undefined),
-			]);
-			await withSoftTimeout(applied, USER_AGENT_TARGET_TIMEOUT_MS, "worker user-agent refresh");
-		}),
-	);
+	const refresh = async (session: CDPSession, url: string) => {
+		if (!sameOrigin(pageUrl, url)) return;
+		await withSoftTimeout(
+			(async () => {
+				await sendUserAgentOverride(wrapSession(session), next);
+				await session.send("Runtime.evaluate", { expression });
+			})(),
+			USER_AGENT_TARGET_TIMEOUT_MS,
+			"worker user-agent refresh",
+		);
+	};
+	await Promise.all([
+		...worker.page.workers().map(dedicated => refresh(dedicated.client, dedicated.url())),
+		...[...worker.targets].map(([session, url]) => refresh(session, url)),
+	]);
 }
 
 /** Exposes executable candidates for detection tests. */

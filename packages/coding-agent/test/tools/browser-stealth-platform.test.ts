@@ -65,6 +65,7 @@ const WORKER_SCRIPTS: Record<string, string> = {
 	"/sw.js": `onmessage = event => event.source.postMessage(${REPORT});`,
 	"/device-shared.js": `onconnect = async event => event.ports[0].postMessage(await (${DEVICE_REPORT})());`,
 	"/device-sw.js": `onmessage = async event => event.source.postMessage(await (${DEVICE_REPORT})());`,
+	"/device-worker.js": `onmessage = async () => postMessage(await (${DEVICE_REPORT})());`,
 };
 
 const IDENTITY_CODE = `return await tab.evaluate(async source => {
@@ -279,6 +280,36 @@ return await tab.evaluate(async () => {
 			expect(service).toEqual(page);
 		} finally {
 			await prelude.invoke({ action: "close", name: "platform-late" }, context);
+		}
+	}, 60_000);
+
+	it("updates a running dedicated worker when the page changes user agent", async () => {
+		await prelude.invoke({ action: "open", name: "platform-dedicated", url: pageUrl }, context);
+		try {
+			await runInTab(
+				"platform-dedicated",
+				`return await tab.evaluate(async () => {
+	window.lateDeviceWorker = new Worker("/device-worker.js");
+	const started = Promise.withResolvers();
+	window.lateDeviceWorker.onmessage = event => started.resolve(event.data);
+	window.lateDeviceWorker.postMessage("report");
+	return await started.promise;
+});`,
+			);
+			const { page, dedicated } = await runInTab<{ page: DeviceIdentity; dedicated: DeviceIdentity }>(
+				"platform-dedicated",
+				`await tab.emulate({ userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CustomBrowser/150.0.0.0 Safari/537.36" });
+return await tab.evaluate(async () => {
+	const report = Promise.withResolvers();
+	window.lateDeviceWorker.onmessage = event => report.resolve(event.data);
+	window.lateDeviceWorker.postMessage("report");
+	return { page: await (${DEVICE_REPORT})(), dedicated: await report.promise };
+});`,
+			);
+			expect(page.userAgent).toContain("CustomBrowser");
+			expect(dedicated).toEqual(page);
+		} finally {
+			await prelude.invoke({ action: "close", name: "platform-dedicated" }, context);
 		}
 	}, 60_000);
 });
