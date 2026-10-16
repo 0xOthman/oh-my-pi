@@ -497,11 +497,13 @@ function streamingDiffLineRows(rawLine: string, innerWidth: number): number {
 }
 
 /**
- * Select the trailing physical lines that fit the live preview budget.
+ * Select the trailing physical lines that cover the live preview budget.
  *
  * Walk backward from the end instead of splitting the complete diff. This keeps
- * allocation and scanning proportional to the visible suffix. One physical line
- * may exceed the budget, but it is still kept so the newest change is visible.
+ * allocation and scanning proportional to the visible suffix. The topmost line
+ * may overrun the budget; {@link formatStreamingDiff} trims its leading rows so
+ * the window holds exactly `budget` rows instead of shrinking by a wrapped
+ * line's height whenever one fails to fit.
  */
 function sliceStreamingDiffTail(diff: string, innerWidth: number, budget: number): StreamingDiffTail {
 	let end = diff.length;
@@ -512,12 +514,10 @@ function sliceStreamingDiffTail(diff: string, innerWidth: number, budget: number
 	let start = end;
 	let cursor = end;
 	let visualRows = 0;
-	while (cursor >= 0) {
+	while (visualRows < rowLimit) {
 		const newline = cursor > 0 ? diff.lastIndexOf("\n", cursor - 1) : -1;
 		const lineStart = newline + 1;
-		const lineRows = streamingDiffLineRows(diff.slice(lineStart, cursor), innerWidth);
-		if (visualRows > 0 && visualRows + lineRows > rowLimit) break;
-		visualRows += lineRows;
+		visualRows += streamingDiffLineRows(diff.slice(lineStart, cursor), innerWidth);
 		start = lineStart;
 		if (newline < 0) break;
 		cursor = newline;
@@ -545,9 +545,10 @@ function formatStreamingDiff(
 	// gets a short fixed tail; expanded widens it to the viewport-sized window,
 	// never unbounded. The budget is VISUAL rows (a long wrapped line counts
 	// for more than one) at the framed block's inner width (border only —
-	// contentPaddingLeft is 0); only the visible suffix is syntax-colored, so
-	// the cheap raw-line wrap walk keeps the per-chunk cost bounded.
-	// innerWidth/budget are in the cache salt so a resize re-slices.
+	// contentPaddingLeft is 0), trimmed to exactly `budget` so the block height
+	// holds steady as wrapped lines enter and leave the window. Only the
+	// visible suffix is syntax-colored and wrapped, so the per-chunk cost stays
+	// bounded. innerWidth/budget are in the cache salt so a resize re-slices.
 	const innerWidth = Math.max(1, width - 2);
 	const budget = expanded ? previewWindowRows() : Math.min(PREVIEW_LIMITS.EXPANDED_LINES, previewWindowRows());
 	let text = cachedRenderedString(cache, uiTheme, expanded, `${rawPath}:${innerWidth}:${budget}`, diff, () => {
@@ -557,13 +558,17 @@ function formatStreamingDiff(
 		// window stutters as rows move between hunks. Expanded widens the window
 		// to the viewport; the full diff appears once the result finalizes.
 		const tail = sliceStreamingDiffTail(diff, innerWidth, budget);
+		const rows = renderDiffColored(tail.content, { filePath: rawPath, theme: uiTheme })
+			.split("\n")
+			.flatMap(line => wrapEditRendererLine(line, innerWidth));
+		const dropped = Math.max(0, rows.length - Math.max(1, budget));
 		let rendered = "\n\n";
-		if (tail.hidden) {
+		if (tail.hidden || dropped > 0) {
 			// Exact hidden line/hunk counts require scanning the discarded prefix,
 			// which would make every streaming update scale with the complete diff.
 			rendered += `${uiTheme.fg("dim", "… (content above)")}\n`;
 		}
-		rendered += renderDiffColored(tail.content, { filePath: rawPath, theme: uiTheme });
+		rendered += rows.slice(dropped).join("\n");
 		return rendered;
 	});
 	// The animated glyph rides this trailing line — inside the transcript's

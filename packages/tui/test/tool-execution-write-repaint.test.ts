@@ -67,6 +67,18 @@ describe("ToolExecutionComponent write repaint seam", () => {
 		expect(requestRender).not.toHaveBeenCalled();
 	});
 
+	it("forces a repaint when few but wrapping lines outgrow the streaming window", () => {
+		// 6 logical lines, each wrapping to several rows at width 80: the window
+		// budgets visual rows, so the head is dropped even under 12 lines.
+		const content = Array.from({ length: 6 }, (_, i) => `line ${i + 1} ${"wrapped prose ".repeat(15)}`).join("\n");
+		const { component, requestRender } = makeComponent({ path: "notes.txt", content });
+		component.render(80);
+
+		component.updateResult(partialWriteResult(), true);
+
+		expect(requestRender).toHaveBeenCalledTimes(1);
+	});
+
 	it("does not repaint an expanded pending preview", () => {
 		// Expanded previews show the whole file top-anchored — no tail window to
 		// re-anchor.

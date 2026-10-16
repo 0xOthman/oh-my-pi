@@ -266,4 +266,29 @@ describe("write streaming preview incremental line tracking", () => {
 		expect(hasLine(rendered, 1)).toBe(true);
 		expect(stripAnsi(rendered.join("\n"))).not.toContain("earlier line");
 	});
+
+	it("holds the collapsed block height steady while wrapped lines stream through the window", async () => {
+		// Markdown-like prose: short headings between paragraphs that wrap to
+		// several rows at width 80. A logical-line budget let each wrapped line
+		// grow the block on arrival and shrink it when it scrolled out (#16033).
+		const uiTheme = await getUiTheme();
+		const content = Array.from({ length: 30 }, (_, i) =>
+			i % 3 === 0 ? `## Heading ${i + 1}` : `Paragraph ${i + 1} ${"lorem ipsum dolor ".repeat((i * 7) % 11)}`,
+		).join("\n");
+		const options = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const heights: number[] = [];
+		for (let end = 8; end <= content.length; end += 8) {
+			const component = writeToolRenderer.renderCall(
+				{ path: "/tmp/notes.md", content: content.slice(0, end) },
+				options,
+				uiTheme,
+			);
+			if (!component) throw new Error("expected a rendered component for a non-xdev write path");
+			heights.push(component.render(80).length);
+		}
+		// Height never shrinks mid-stream, and once the 12-row window fills it is
+		// pinned: header border + marker + 12 rows + streaming footer + bottom border.
+		for (let i = 1; i < heights.length; i++) expect(heights[i]).toBeGreaterThanOrEqual(heights[i - 1]!);
+		expect(heights.at(-1)).toBe(16);
+	});
 });

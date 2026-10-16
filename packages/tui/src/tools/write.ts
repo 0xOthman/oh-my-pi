@@ -92,6 +92,8 @@ interface WriteRenderArgs {
 }
 
 const WRITE_PREVIEW_LINES = 6;
+/** Visual rows the collapsed streaming preview keeps at the live edge. */
+const WRITE_STREAMING_TAIL_ROWS = PREVIEW_LIMITS.EXPANDED_LINES;
 /** Collapsed native write body: the first lines of the file (§7.3). */
 const NATIVE_WRITE_PREVIEW = { lines: 8 } as const;
 /**
@@ -174,24 +176,6 @@ function countLines(text: string): number {
 	return text.split("\n").length;
 }
 
-/** Bounded newline scan: whether `text` spans more than `maxLines` lines.
- *  Runs on every live compose (the repaint predicate below), so it must not
- *  materialize the split the way `countLines` does. */
-function exceedsLineCount(text: string, maxLines: number): boolean {
-	if (!text) return false;
-	let lines = 1;
-	for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) {
-		if (++lines > maxLines) return true;
-	}
-	return false;
-}
-
-function writeContentOf(args: unknown): string {
-	if (args == null || typeof args !== "object" || !("content" in args)) return "";
-	const content = args.content;
-	return typeof content === "string" ? content : "";
-}
-
 function formatLineCountSuffix(lineCount: number, uiTheme: Theme): string {
 	if (lineCount <= 0) return "";
 	return uiTheme.fg("dim", ` · ${lineCount} line${lineCount === 1 ? "" : "s"}`);
@@ -218,6 +202,8 @@ function normalizeDisplayText(text: unknown): string {
 const WRITE_GUTTER_MIN_WIDTH = 3;
 
 const writeStreamingPreviewStateKey = Symbol("writeStreamingPreviewState");
+/** Whether the last painted streaming preview dropped head rows behind its tail window. */
+const writeStreamingTailWindowedKey = Symbol("writeStreamingTailWindowed");
 
 /**
  * Per-component state for incrementally rendering a streamed write.
@@ -245,6 +231,7 @@ interface WriteStreamingPreviewState {
 
 interface WriteStreamingPreviewStateCarrier {
 	[writeStreamingPreviewStateKey]?: WriteStreamingPreviewState;
+	[writeStreamingTailWindowedKey]?: boolean;
 }
 
 function createWriteStreamingPreviewState(language: string | undefined, uiTheme: Theme): WriteStreamingPreviewState {
@@ -334,25 +321,31 @@ function updateStreamingPreview(
 	return state;
 }
 
+/**
+ * Numbered, highlighted rows of the streamed content, one per logical line and
+ * width-independent (so the cache survives resizes). Collapsed keeps only the
+ * last {@link WRITE_STREAMING_TAIL_ROWS} lines: each line wraps to at least one
+ * visual row, so that suffix always covers the row budget
+ * {@link layoutStreamingRows} trims to.
+ */
 function formatStreamingContent(
 	content: string,
 	expanded: boolean,
 	language: string | undefined,
 	uiTheme: Theme,
-	spinnerFrame?: number,
 	cache?: RenderedStringCache,
 	streamKey?: WriteStreamingPreviewStateCarrier,
 	argsComplete?: boolean,
 ): string {
 	if (!content) return "";
-	const bodyText = cachedRenderedString(cache, uiTheme, expanded, language ?? "", content, () => {
+	return cachedRenderedString(cache, uiTheme, expanded, language ?? "", content, () => {
 		const state = updateStreamingPreview(streamKey, content, language, uiTheme, argsComplete === true);
 		let totalLines: number;
 		let startIndex: number;
 		let visibleLines: string[];
 		if (state) {
 			totalLines = state.lineCount;
-			startIndex = expanded ? 0 : Math.max(0, totalLines - PREVIEW_LIMITS.EXPANDED_LINES);
+			startIndex = expanded ? 0 : Math.max(0, totalLines - WRITE_STREAMING_TAIL_ROWS);
 			const flushed = argsComplete === true && state.finalFlushedLength === content.length;
 			const trailingLine = flushed ? state.finalTrailing : content.slice(state.completeLength).replace(/\r/g, "");
 			if (totalLines === 1 && trailingLine.length === 0) return "";
@@ -362,40 +355,84 @@ function formatStreamingContent(
 			if (normalized.length === 0) return "";
 			const lines = normalized.split("\n");
 			totalLines = lines.length;
-			startIndex = expanded ? 0 : Math.max(0, totalLines - PREVIEW_LIMITS.EXPANDED_LINES);
+			startIndex = expanded ? 0 : Math.max(0, totalLines - WRITE_STREAMING_TAIL_ROWS);
 			visibleLines = highlightCode(lines.slice(startIndex).join("\n"), language);
 		}
-		const hidden = startIndex;
 		const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
-
-		let text = "\n\n";
-		if (hidden > 0) {
-			text += `${uiTheme.fg("dim", `… (${hidden} earlier line${hidden === 1 ? "" : "s"})`)}\n`;
-		}
-		for (let i = 0; i < visibleLines.length; i++) {
-			const lineNum = startIndex + i + 1;
-			const gutter = uiTheme.fg("dim", `${String(lineNum).padStart(lineNumberWidth, " ")} `);
-			const body = replaceTabs(visibleLines[i] ?? "");
-			text += `${gutter}${body}\n`;
-		}
-		return text;
+		return visibleLines
+			.map((line, i) => {
+				const gutter = uiTheme.fg("dim", `${String(startIndex + i + 1).padStart(lineNumberWidth, " ")} `);
+				return `${gutter}${replaceTabs(line)}`;
+			})
+			.join("\n");
 	});
-	if (bodyText.length === 0) return "";
+}
+
+/** Laid-out streaming preview rows; `hiddenLines > 0` means the head was dropped behind the tail window. */
+interface StreamingRows {
+	rows: string[];
+	hiddenLines: number;
+}
+
+/**
+ * Lay out the streaming preview body at `width`: numbered rows from
+ * {@link formatStreamingContent} wrap under their gutter, then collapsed keeps
+ * exactly the last {@link WRITE_STREAMING_TAIL_ROWS} visual rows behind an
+ * `… (N earlier lines)` marker, and the live `… (streaming)` footer closes the
+ * block. Budgeting visual rows (not logical lines) holds the block height
+ * steady once the window fills: a wrapped line neither adds rows on arrival
+ * nor removes them when it scrolls out.
+ */
+function layoutStreamingRows(
+	body: string,
+	width: number,
+	expanded: boolean,
+	uiTheme: Theme,
+	spinnerFrame?: number,
+): StreamingRows {
+	const lines = body.split("\n");
+	let rows: string[];
+	let hiddenLines = 0;
+	if (expanded) {
+		rows = lines.flatMap(line => wrapWritePreviewRow(line, width));
+	} else {
+		// Walk back from the live edge, wrapping only what the window can show.
+		const chunks: string[][] = [];
+		let rowCount = 0;
+		let top = lines.length;
+		while (top > 0 && rowCount < WRITE_STREAMING_TAIL_ROWS) {
+			const wrapped = wrapWritePreviewRow(lines[--top]!, width);
+			chunks.push(wrapped);
+			rowCount += wrapped.length;
+		}
+		rows = chunks.reverse().flat();
+		if (rows.length > WRITE_STREAMING_TAIL_ROWS) rows = rows.slice(rows.length - WRITE_STREAMING_TAIL_ROWS);
+		// Lines entirely above the window: all before the topmost line that
+		// still contributes a row, whose number its gutter carries.
+		const topNumber = WRITE_GUTTER_PATTERN.exec(lines[top] ?? "")?.[2];
+		hiddenLines = topNumber === undefined ? 0 : Number(topNumber) - 1;
+	}
+	if (hiddenLines > 0) {
+		rows.unshift(uiTheme.fg("dim", `… (${hiddenLines} earlier line${hiddenLines === 1 ? "" : "s"})`));
+	}
 	// The animated glyph lives on this trailing line — inside the transcript's
 	// volatile-tail holdback — never in the header: an animating head row pins
 	// the native-scrollback commit boundary at the top of the block, so a long
 	// expanded preview could never scroll-append mid-stream.
 	const spinner = spinnerFrame !== undefined ? `${formatStatusIcon("running", uiTheme, spinnerFrame)} ` : "";
-	return `${bodyText}${spinner}${uiTheme.fg("dim", `… (streaming)`)}`;
+	rows.push(`${spinner}${uiTheme.fg("dim", "… (streaming)")}`);
+	return { rows, hiddenLines };
 }
 
-function wrapWritePreviewRows(lines: string[], width: number): string[] {
-	return lines.flatMap(line => {
-		const gutter = /^(\x1b\[[0-9;]*m)( *\d+ )(\x1b\[[0-9;]*m)(.*)$/.exec(line);
-		if (!gutter) return line;
-		const prefix = `${gutter[1]}${gutter[2]}${gutter[3]}`;
-		return wrapPrefixedLine(prefix, " ".repeat(Bun.stringWidth(gutter[2]!)), gutter[4] ?? "", width);
-	});
+/** Numbered write row: dim gutter SGR, padded line number, SGR reset, body. */
+const WRITE_GUTTER_PATTERN = /^(\x1b\[[0-9;]*m)( *\d+ )(\x1b\[[0-9;]*m)(.*)$/;
+
+/** Wrap a numbered write row so continuations hang under its gutter; other rows pass through. */
+function wrapWritePreviewRow(line: string, width: number): string[] {
+	const gutter = WRITE_GUTTER_PATTERN.exec(line);
+	if (!gutter) return [line];
+	const prefix = `${gutter[1]}${gutter[2]}${gutter[3]}`;
+	return wrapPrefixedLine(prefix, " ".repeat(Bun.stringWidth(gutter[2]!)), gutter[4] ?? "", width);
 }
 
 function renderContentPreview(
@@ -650,27 +687,29 @@ export const writeToolRenderer = {
 		return framedToolCard(
 			uiTheme,
 			({ contentWidth }) => {
+				const expanded = Boolean(options.expanded);
 				const body = content
 					? formatStreamingContent(
 							content,
-							Boolean(options?.expanded),
+							expanded,
 							lang,
 							uiTheme,
-							options?.spinnerFrame,
 							streamingCache,
 							// `options` is the ToolExecutionComponent's persistent
 							// render-state object — a stable identity across reveal ticks
 							// that keys the incremental preview state. `argsComplete`
 							// flushes the trailing line through the highlighter once.
 							options,
-							options?.argsComplete,
+							options.argsComplete,
 						)
 					: "";
-				const bodyLines = body ? body.split("\n") : [];
-				while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
+				const preview = body
+					? layoutStreamingRows(body, contentWidth, expanded, uiTheme, options.spinnerFrame)
+					: undefined;
+				options[writeStreamingTailWindowedKey] = preview !== undefined && preview.hiddenLines > 0;
 				return {
 					header,
-					sections: bodyLines.length > 0 ? [{ content: wrapWritePreviewRows(bodyLines, contentWidth) }] : [],
+					sections: preview ? [{ content: preview.rows }] : [],
 					phase: "pending",
 					borderColor: "borderMuted",
 				};
@@ -778,7 +817,10 @@ export const writeToolRenderer = {
 				while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 				return {
 					header,
-					sections: bodyLines.length > 0 ? [{ content: wrapWritePreviewRows(bodyLines, contentWidth) }] : [],
+					sections:
+						bodyLines.length > 0
+							? [{ content: bodyLines.flatMap(line => wrapWritePreviewRow(line, contentWidth)) }]
+							: [],
 					phase: isPartial ? "partial" : "success",
 					borderColor: "borderMuted",
 				};
@@ -861,6 +903,10 @@ export const writeToolRenderer = {
 	// tail rows already committed to viewport/native scrollback would survive
 	// as stale content above the new frame without a full replay. Expanded and
 	// short previews stay top-anchored and skip the (scrollback-wiping) reset.
-	forceFirstResultViewportRepaint: (args: unknown, options: RenderResultOptions) =>
-		!options.expanded && exceedsLineCount(writeContentOf(args), PREVIEW_LIMITS.EXPANDED_LINES),
+	// The window budgets wrapped rows at the paint width, so the last paint
+	// records whether it dropped the head rather than recounting lines here.
+	forceFirstResultViewportRepaint: (
+		_args: unknown,
+		options: RenderResultOptions & WriteStreamingPreviewStateCarrier,
+	) => options[writeStreamingTailWindowedKey] === true,
 } satisfies ToolRenderer<WriteRenderArgs, WriteToolDetails>;

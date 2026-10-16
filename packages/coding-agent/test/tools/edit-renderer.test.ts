@@ -156,6 +156,31 @@ describe("editToolRenderer", () => {
 		expect(rendered).not.toContain("more lines above");
 	});
 
+	it("holds the streaming diff height steady as wrapped lines pass through the tail window", async () => {
+		// Whole-line slicing left the window short by however many rows the next
+		// wrapped line would not fit, so the block jittered as lines streamed (#16033).
+		const uiTheme = await getUiTheme();
+		const lines = Array.from(
+			{ length: 40 },
+			(_, index) => `+${index + 1}|Paragraph ${index} ${"lorem ipsum dolor ".repeat((index * 7) % 11)}`,
+		);
+		const heights = lines.map(
+			(_, index) =>
+				editToolRenderer
+					.renderCall(
+						{ file_path: "/tmp/notes.md", previewDiff: lines.slice(0, index + 1).join("\n") },
+						{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "replace" } },
+						uiTheme,
+					)
+					.render(80).length,
+		);
+
+		for (let index = 1; index < heights.length; index++) {
+			expect(heights[index]).toBeGreaterThanOrEqual(heights[index - 1]!);
+		}
+		expect(new Set(heights.slice(-20)).size).toBe(1);
+	});
+
 	it("uses hashline input headers for streaming call path without apply_patch errors", async () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderCall(
