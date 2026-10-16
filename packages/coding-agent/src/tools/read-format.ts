@@ -472,24 +472,25 @@ export async function buildInMemoryTextResult(
 
 	if (truncation.firstLineExceedsLimit) {
 		const firstLineBytes = truncation.totalBytes;
+		// Hashline output cannot show part of a line, so it displays none of it;
+		// the stats must say so rather than describe the discarded prefix.
+		const shown = shouldAddHashLines ? { ...truncation, content: "", outputLines: 0, outputBytes: 0 } : truncation;
 
 		if (shouldAddHashLines) {
 			outputText = `[Line ${startLineDisplay} is ${formatBytes(
 				firstLineBytes,
 			)}, exceeds ${formatBytes(DEFAULT_MAX_BYTES)} limit. Hashline output requires full lines; cannot emit an editable numbered preview for a truncated line.]`;
+		} else if (shown.content.length > 0) {
+			outputText = formatText(shown.content, startLineDisplay);
 		} else {
-			outputText = formatText(truncation.content, startLineDisplay);
-		}
-
-		if (truncation.content.length === 0) {
 			outputText = `[Line ${startLineDisplay} is ${formatBytes(
 				firstLineBytes,
 			)}, exceeds ${formatBytes(DEFAULT_MAX_BYTES)} limit. Unable to display a valid UTF-8 snippet.]`;
 		}
 
-		details.truncation = toReadTruncationStats(truncation);
+		details.truncation = toReadTruncationStats(shown);
 		truncationInfo = {
-			result: truncation,
+			result: shown,
 			options: { direction: "head", startLine: startLineDisplay, totalFileLines: totalLines },
 		};
 	} else if (truncation.truncated) {

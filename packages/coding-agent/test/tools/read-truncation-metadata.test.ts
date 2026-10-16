@@ -11,6 +11,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { ReadToolDetails, ReadTruncationStats } from "@oh-my-pi/pi-tui/tools/read";
 import { formatTruncationMetaNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { buildInMemoryTextResult } from "@oh-my-pi/pi-coding-agent/tools/read-format";
 import { readToolRenderer } from "@oh-my-pi/pi-tui/tools/read";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
 
@@ -209,6 +210,21 @@ describe("read truncation metadata", () => {
 			shownRange: { start: 1, end: 1 },
 			outputBytes: DEFAULT_MAX_BYTES,
 		});
+	});
+
+	it("reports no displayed bytes when hashline mode suppresses an oversized in-memory line", async () => {
+		const line = "x".repeat(DEFAULT_MAX_BYTES + 1);
+		const result = persistedResult(
+			await buildInMemoryTextResult(session, `${line}\nlast`, undefined, undefined, {
+				sourcePath: path.join(root, "wide.txt"),
+				entityLabel: "file",
+			}),
+		);
+
+		expect(textOutput(result)).toContain("Hashline output requires full lines");
+		expect(textOutput(result)).not.toContain("xxxx");
+		expect(result.details?.truncation).toMatchObject({ outputLines: 0, outputBytes: 0 });
+		expect(result.details?.meta?.truncation).toMatchObject({ outputBytes: 0 });
 	});
 
 	it.each(["directory", "archive", "sqlite"] as const)(
