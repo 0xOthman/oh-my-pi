@@ -6664,6 +6664,34 @@ export class AgentSession implements SettingsScope {
 		return { ...context, messages: [...context.messages, evalStateContext] };
 	}
 
+	/**
+	 * Writes the eval runtime snapshot `navigateTree` adds to `context` into the
+	 * session file at the new leaf, so a fork or reload of this branch rebuilds
+	 * the live request prefix (#15933). Re-navigating to the same point reuses an
+	 * identical snapshot child instead of growing a sibling per jump. Returns
+	 * whether the leaf moved.
+	 */
+	#persistNavigationEvalStateContext(context: SessionContext): boolean {
+		const snapshot = this.#buildEvalStateContextMessage();
+		if (!snapshot || !this.#needsEvalStateContext(context.messages, snapshot.content)) return false;
+		const leafId = this.sessionManager.getLeafId();
+		const existing =
+			leafId === null
+				? undefined
+				: this.sessionManager
+						.getChildren(leafId)
+						.find(
+							entry =>
+								entry.type === "message" &&
+								entry.message.role === "custom" &&
+								entry.message.customType === "eval-state-context" &&
+								entry.message.content === snapshot.content,
+						);
+		if (existing) this.sessionManager.branch(existing.id);
+		else this.sessionManager.appendMessage(snapshot);
+		return true;
+	}
+
 	#needsEvalStateContext(messages: AgentMessage[], content: CustomMessage["content"]): boolean {
 		const latest = messages.findLast(
 			message => message.role === "custom" && message.customType === "eval-state-context",
@@ -12491,9 +12519,11 @@ export class AgentSession implements SettingsScope {
 		}
 
 		// Update agent state — build display context to populate agent messages.
-		const stateContext = this.sessionManager.buildSessionContext({
-			maxFrameDataBytes: frameDataBytesBudget(this.model),
-		});
+		const maxFrameDataBytes = frameDataBytesBudget(this.model);
+		let stateContext = this.sessionManager.buildSessionContext({ maxFrameDataBytes });
+		if (this.#persistNavigationEvalStateContext(deobfuscateSessionContext(stateContext, this.#obfuscator))) {
+			stateContext = this.sessionManager.buildSessionContext({ maxFrameDataBytes });
+		}
 		const displayContext = this.#withEvalStateContext(deobfuscateSessionContext(stateContext, this.#obfuscator));
 		this.agent.replaceMessages(displayContext.messages);
 		this.#rehydrateCheckpointRewindState();

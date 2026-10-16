@@ -1381,7 +1381,7 @@ export class SelectorController {
 			}
 			const fastRewind =
 				treeRewind !== undefined &&
-				this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+				this.#leafRendersAt(treeRewind.expectedLeafId) &&
 				this.ctx.truncateTranscriptFromMessage(treeRewind.message);
 			if (!fastRewind) {
 				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
@@ -1592,7 +1592,7 @@ export class SelectorController {
 							!wantsSummary &&
 							!result.summaryEntry &&
 							!result.askReanswerCommitted &&
-							this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
+							this.#leafRendersAt(treeRewind.expectedLeafId) &&
 							this.ctx.truncateTranscriptFromMessage(treeRewind.message);
 						if (!fastRewind) {
 							await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
@@ -1675,6 +1675,24 @@ export class SelectorController {
 			message: boundary.message,
 			expectedLeafId,
 		};
+	}
+
+	/**
+	 * Whether the transcript renders up to `entryId`: the leaf is `entryId` or
+	 * sits on it through hidden custom messages only (e.g. the eval-state
+	 * snapshot `navigateTree` persists), which never render a component.
+	 */
+	#leafRendersAt(entryId: string): boolean {
+		let entry = this.ctx.sessionManager.getLeafEntry();
+		while (entry) {
+			if (entry.id === entryId) return true;
+			const hidden =
+				(entry.type === "custom_message" && !entry.display) ||
+				(entry.type === "message" && entry.message.role === "custom" && !entry.message.display);
+			if (!hidden || !entry.parentId) return false;
+			entry = this.ctx.sessionManager.getEntry(entry.parentId);
+		}
+		return false;
 	}
 
 	/**
