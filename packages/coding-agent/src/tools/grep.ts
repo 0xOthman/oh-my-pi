@@ -627,6 +627,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					limitReached: false,
 				};
 				let skippedOversizedCount = 0;
+				// Named files native streamed only up to a line over its buffer cap
+				// (or could not read at all); later matches are missing.
+				const partialFiles: string[] = [];
 				// Only a glob spelled without a directory prefix matches at any depth.
 				// The parsed base alone cannot distinguish `*.ts` from `./*.ts`.
 				try {
@@ -666,7 +669,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								},
 								undefined,
 							);
-							skippedOversizedCount += targetResult.skippedOversized ?? 0;
+							if (exactFilePaths && targetResult.skippedOversized) {
+								partialFiles.push(target.basePath);
+							} else {
+								skippedOversizedCount += targetResult.skippedOversized ?? 0;
+							}
 							limitReached = limitReached || Boolean(targetResult.limitReached);
 							totalMatches += targetResult.totalMatches;
 							filesSearched += targetResult.filesSearched;
@@ -714,7 +721,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							},
 							undefined,
 						);
-						skippedOversizedCount = result.skippedOversized ?? 0;
+						if (!isDirectory && result.skippedOversized) {
+							partialFiles.push(searchPath);
+						} else {
+							skippedOversizedCount = result.skippedOversized ?? 0;
+						}
 					}
 				} catch (err) {
 					if (err instanceof Error && /^regex(?: parse)? error/i.test(err.message)) {
@@ -845,8 +856,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const limitMb = Math.floor(NATIVE_GREP_MAX_FILE_BYTES / (1024 * 1024));
 				// Native streams an explicitly named file whole, except in multiline
 				// mode, which holds the file in memory and so reads only its first
-				// NATIVE_GREP_MAX_FILE_BYTES; without this note the caller might miss
-				// that matches beyond the window (or "no matches") reflect partial
+				// NATIVE_GREP_MAX_FILE_BYTES, and past a line longer than that cap,
+				// where the stream stops. Without these notes the caller might miss
+				// that matches beyond that point (or "no matches") reflect partial
 				// coverage, not the whole file.
 				const oversizedNote = await (async (): Promise<string | undefined> => {
 					if (!effectiveMultiline) return undefined;
@@ -873,6 +885,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					if (oversized.length === 0) return undefined;
 					return `Multiline search read only the first ${limitMb}MB of large files (matches past the ${limitMb}MB window are not shown; search without a newline in the pattern, or use \`read\`, for the rest): ${oversized.join(", ")}`;
 				})();
+				// Multiline files are already named by `oversizedNote`.
+				const partialNote =
+					!effectiveMultiline && partialFiles.length > 0
+						? `Stopped searching large files at a line longer than ${limitMb}MB or a read error (matches past that point are not shown; use \`read\` for the rest): ${partialFiles.map(file => formatPathRelativeToCwd(file, this.session.cwd)).join(", ")}`
+						: undefined;
 				// Directory/multi-target scopes: native counts files it could not map
 				// even a prefix of (rare mmap failures), but cannot name them.
 				const oversizedScanNote =
@@ -890,7 +907,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const missingPathsNote =
 					missingPathsForNote.length > 0 ? `Skipped missing paths: ${missingPathsForNote.join(", ")}` : undefined;
 				const warningNote =
-					[missingPathsNote, archiveNote, oversizedNote, oversizedScanNote]
+					[missingPathsNote, archiveNote, oversizedNote, partialNote, oversizedScanNote]
 						.filter((s): s is string => Boolean(s))
 						.join("\n") || undefined;
 				if (selectedMatches.length === 0) {
@@ -907,8 +924,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					const skipPastEnd = canPaginate && normalizedSkip > 0 && totalFiles > 0 && skipFiles >= totalFiles;
 					const noMatchText = skipPastEnd
 						? `No more results (${totalFilesLabel} files total; skip=${normalizedSkip} is past the end)`
-						: oversizedNote
-							? `No matches in searched content (multiline search limited large files to their first ${limitMb}MB)`
+						: oversizedNote || partialNote
+							? "No matches in searched content (large files were only partly searched)"
 							: "No matches found";
 					const text = warningNote ? `${noMatchText}\n${warningNote}` : noMatchText;
 					// Zero matches is useless regardless of warnings: by the time

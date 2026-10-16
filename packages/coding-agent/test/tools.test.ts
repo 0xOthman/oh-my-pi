@@ -2811,28 +2811,46 @@ function b() {
 
 		it("searches all of a named file larger than the directory-walk window", async () => {
 			const testFile = path.join(testDir, "manual.txt");
-			await Bun.write(
-				testFile,
-				`${"x".repeat(2 * 1024 * 1024)}\nEARLYNEEDLE\n${"x".repeat(5 * 1024 * 1024)}\nLATENEEDLE\n`,
-			);
+			const filler = (bytes: number) => `${"x".repeat(99)}\n`.repeat(bytes / 100);
+			await Bun.write(testFile, `${filler(2_000_000)}EARLYNEEDLE\n${filler(5_000_000)}LATENEEDLE\n`);
 
 			const whole = getTextOutput(
 				await searchTool.execute("grep-large-whole", { pattern: "EARLYNEEDLE|LATENEEDLE", path: testFile }),
 			);
-			expect(whole).toMatch(/\*2\|EARLYNEEDLE/);
-			expect(whole).toMatch(/\*4\|LATENEEDLE/);
+			expect(whole).toMatch(/\*20001\|EARLYNEEDLE/);
+			expect(whole).toMatch(/\*70002\|LATENEEDLE/);
+			expect(whole).not.toContain("partly searched");
 
 			const ranged = getTextOutput(
-				await searchTool.execute("grep-large-range", { pattern: "LATENEEDLE", path: `${testFile}:3-` }),
+				await searchTool.execute("grep-large-range", { pattern: "LATENEEDLE", path: `${testFile}:60000-` }),
 			);
-			expect(ranged).toMatch(/\*4\|LATENEEDLE/);
+			expect(ranged).toMatch(/\*70002\|LATENEEDLE/);
 
 			// Multiline matching holds the file in memory, so it reads only the leading window and says so.
 			const multiline = getTextOutput(
 				await searchTool.execute("grep-large-multiline", { pattern: "x\nLATENEEDLE", path: testFile }),
 			);
-			expect(multiline).toMatch(/^No matches in searched content \(multiline search limited large files/);
+			expect(multiline).toMatch(/^No matches in searched content \(large files were only partly searched\)/);
+			expect(multiline).toContain("Multiline search read only the first 4MB");
 			expect(multiline).toContain("manual.txt");
+		});
+
+		it("reports a named file cut short by a line over the 4MB buffer cap as partly searched", async () => {
+			const testFile = path.join(testDir, "bundle.min.js");
+			await Bun.write(testFile, `EARLYNEEDLE\n${"x".repeat(5 * 1024 * 1024)}\nLATENEEDLE\n`);
+
+			const late = getTextOutput(
+				await searchTool.execute("grep-long-line", { pattern: "LATENEEDLE", path: testFile }),
+			);
+			expect(late).toMatch(/^No matches in searched content \(large files were only partly searched\)/);
+			expect(late).toContain("Stopped searching large files at a line longer than 4MB");
+			expect(late).toContain("bundle.min.js");
+
+			const early = getTextOutput(
+				await searchTool.execute("grep-long-line-early", { pattern: "EARLYNEEDLE", path: testFile }),
+			);
+			expect(early).toMatch(/\*1\|EARLYNEEDLE/);
+			expect(early).toContain("Stopped searching large files at a line longer than 4MB");
 		});
 
 		it("flags a zero-match search as contextually useless", async () => {

@@ -244,7 +244,8 @@ pub struct GrepResult {
 	pub files_searched:     u32,
 	/// Whether the limit/offset stopped the search early.
 	pub limit_reached:      Option<bool>,
-	/// Number of files skipped because they exceed the size limit.
+	/// Number of files over the size limit that were skipped, or (for a file
+	/// named directly) searched only up to a line longer than the limit.
 	pub skipped_oversized:  Option<u32>,
 }
 
@@ -308,6 +309,9 @@ struct SearchResultInternal {
 	match_count:   u64,
 	collected:     u64,
 	limit_reached: bool,
+	/// A streamed file stopped before its end (a line over [`MAX_FILE_BYTES`]
+	/// or a read error); the matches cover only the part before it.
+	partial:       bool,
 }
 
 #[derive(Debug)]
@@ -373,12 +377,13 @@ impl<'m, M: Matcher> MatchCollector<'m, M> {
 		)
 	}
 
-	fn into_result(self) -> SearchResultInternal {
+	fn into_result(self, partial: bool) -> SearchResultInternal {
 		SearchResultInternal {
-			matches:       self.matches,
-			match_count:   self.match_count,
-			collected:     self.collected_count,
+			matches: self.matches,
+			match_count: self.match_count,
+			collected: self.collected_count,
 			limit_reached: self.limit_reached,
+			partial,
 		}
 	}
 }
@@ -766,15 +771,38 @@ enum Haystack<'a> {
 }
 
 impl Haystack<'_> {
+	/// Searcher for this haystack. A streamed file caps the line buffer at
+	/// [`MAX_FILE_BYTES`], so one unbroken line (minified JS or JSON) cannot
+	/// grow it to the line's full length.
+	fn searcher(&self, params: SearchParams) -> Searcher {
+		let mut builder = searcher_builder(params);
+		if let Haystack::Reader(_) = self {
+			builder.heap_limit(Some(MAX_FILE_BYTES as usize));
+		}
+		builder.build()
+	}
+
+	/// Searches into `sink`, returning whether the whole haystack was covered.
+	///
+	/// A streamed file that hits the line-buffer limit or a read error stops
+	/// there with the matches found before it; only cancellation and sink
+	/// failures are errors.
 	fn search<M: Matcher, S: Sink<Error = io::Error>>(
 		self,
 		searcher: &mut Searcher,
 		matcher: &M,
 		sink: S,
-	) -> io::Result<()> {
+	) -> io::Result<bool> {
 		match self {
-			Haystack::Slice(content) => searcher.search_slice(matcher, content, sink),
-			Haystack::Reader(reader) => searcher.search_reader(matcher, reader, sink),
+			Haystack::Slice(content) => searcher.search_slice(matcher, content, sink).map(|()| true),
+			Haystack::Reader(reader) => {
+				let ct = reader.ct;
+				match searcher.search_reader(matcher, reader, sink) {
+					Ok(()) => Ok(true),
+					Err(err) if ct.heartbeat().is_err() => Err(err),
+					Err(_) => Ok(false),
+				}
+			},
 		}
 	}
 }
@@ -801,7 +829,7 @@ fn run_search<M: Matcher + Sync>(
 	content: Haystack<'_>,
 	params: SearchParams,
 ) -> io::Result<SearchResultInternal> {
-	run_search_in(&mut build_searcher_for_params(params), matcher, content, params)
+	run_search_in(&mut content.searcher(params), matcher, content, params)
 }
 
 fn run_search_in<M: Matcher + Sync>(
@@ -811,8 +839,8 @@ fn run_search_in<M: Matcher + Sync>(
 	params: SearchParams,
 ) -> io::Result<SearchResultInternal> {
 	let mut collector = MatchCollector::for_params(matcher, params);
-	content.search(searcher, matcher, &mut collector)?;
-	Ok(collector.into_result())
+	let whole = content.search(searcher, matcher, &mut collector)?;
+	Ok(collector.into_result(!whole))
 }
 
 /// Content-mode search of `content` that streams its matches to `sink` as
@@ -835,29 +863,32 @@ fn run_streaming_search_in<M: Matcher + Sync>(
 	};
 	let searched = content
 		.search(searcher, matcher, &mut collector)
-		.and_then(|()| collector.flush());
+		.and_then(|whole| collector.flush().map(|()| whole));
 	if let Some(err) = collector.failure {
 		return Err(err);
 	}
-	Ok(searched.map(|()| collector.collector.into_result()))
+	Ok(searched.map(|whole| collector.collector.into_result(!whole)))
 }
 
 fn build_searcher_for_params(params: SearchParams) -> Searcher {
+	searcher_builder(params).build()
+}
+
+fn searcher_builder(params: SearchParams) -> SearcherBuilder {
 	let collect_content = params.mode == OutputMode::Content;
-	build_searcher(
-		if collect_content {
-			params.context_before
-		} else {
-			0
-		},
-		if collect_content {
-			params.context_after
-		} else {
-			0
-		},
-		params.multiline,
-		collect_content,
-	)
+	let (context_before, context_after) = if collect_content {
+		(params.context_before, params.context_after)
+	} else {
+		(0, 0)
+	};
+	let mut builder = SearcherBuilder::new();
+	builder
+		.binary_detection(BinaryDetection::quit(b'\x00'))
+		.line_number(collect_content)
+		.multi_line(params.multiline)
+		.before_context(context_before as usize)
+		.after_context(context_after as usize);
+	builder
 }
 std::thread_local! {
 	static PARALLEL_GREP_SEARCHER: RefCell<Option<(SearchParams, SearchWorker)>> =
@@ -876,21 +907,6 @@ fn with_parallel_grep_searcher<T>(
 		let (_, worker) = cached.as_mut().expect("parallel grep searcher initialized");
 		search(worker)
 	})
-}
-
-fn build_searcher(
-	context_before: u32,
-	context_after: u32,
-	multiline: bool,
-	line_number: bool,
-) -> Searcher {
-	SearcherBuilder::new()
-		.binary_detection(BinaryDetection::quit(b'\x00'))
-		.line_number(line_number)
-		.multi_line(multiline)
-		.before_context(context_before as usize)
-		.after_context(context_after as usize)
-		.build()
 }
 
 const FILE_CLASSIFICATION_READ_BYTES: u64 = MAX_FILE_BYTES + 1;
@@ -1356,6 +1372,7 @@ fn search_file_bytes<M: Matcher + Sync>(
 			match_count:   u64::from(matched),
 			collected:     u64::from(matched),
 			limit_reached: false,
+			partial:       false,
 		});
 	}
 	run_search_in(searcher, matcher, Haystack::Slice(bytes), params).ok()
@@ -1607,6 +1624,7 @@ fn search_one_file<M: Matcher + Sync>(
 		match_count:   0,
 		collected:     0,
 		limit_reached: false,
+		partial:       false,
 	})))
 }
 
@@ -2332,10 +2350,10 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 
 		// Only directory walks cap the bytes read per file, where every worker
 		// would otherwise hold a whole large file at once. A file named on
-		// its own is streamed through the searcher's bounded buffer so all
-		// of it is searched. Multiline matching needs the whole file in
-		// memory, so it keeps the leading window and reports the file as
-		// partially searched.
+		// its own is streamed through the searcher's line buffer, capped at
+		// MAX_FILE_BYTES, so all of it is searched unless one line exceeds the
+		// cap. Multiline matching needs the whole file in memory, so it keeps
+		// the leading window and reports the file as partially searched.
 		let mut buffer = Vec::new();
 		let haystack = match read_file_bytes(fs, &search_path, &mut buffer) {
 			Ok(ReadFile::Read) => Haystack::Slice(&buffer),
@@ -2422,7 +2440,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 		let path_string = search_path.to_string_lossy().into_owned();
 		let search = match stream {
 			Some(sink) if output_mode == OutputMode::Content => run_streaming_search_in(
-				&mut build_searcher_for_params(params),
+				&mut haystack.searcher(params),
 				matcher,
 				haystack,
 				params,
@@ -2433,14 +2451,18 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 		}
 		.map_err(|err| Error::from_reason(format!("Search failed: {err}")))?;
 
+		// A streamed file cut short by an overlong line (or a read error) is
+		// reported as partly searched, so a miss past that point is not taken
+		// as absence.
+		let skipped_oversized = search.partial.then_some(1);
 		if search.match_count == 0 {
 			return Ok(GrepResult {
-				matches:            Vec::new(),
-				total_matches:      0,
+				matches: Vec::new(),
+				total_matches: 0,
 				files_with_matches: 0,
-				files_searched:     1,
-				limit_reached:      None,
-				skipped_oversized:  None,
+				files_searched: 1,
+				limit_reached: None,
+				skipped_oversized,
 			});
 		}
 
@@ -2475,16 +2497,24 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 			},
 		}
 
-		let limit_reached =
-			search.limit_reached || max_count.is_some_and(|max| search.collected >= max);
+		let (total_matches, limit_reached) = match output_mode {
+			// One matching file. The collector's internal one-match cap (see
+			// `single_file_params`) stops it at a second hit; that is neither a
+			// match count nor a caller limit.
+			OutputMode::FilesWithMatches => (1, false),
+			OutputMode::Content | OutputMode::Count => (
+				crate::utils::clamp_u32(search.match_count),
+				search.limit_reached || max_count.is_some_and(|max| search.collected >= max),
+			),
+		};
 
 		return hand_off(stream, GrepResult {
 			matches,
-			total_matches: crate::utils::clamp_u32(search.match_count),
+			total_matches,
 			files_with_matches: 1,
 			files_searched: 1,
 			limit_reached: if limit_reached { Some(true) } else { None },
-			skipped_oversized: None,
+			skipped_oversized,
 		});
 	}
 
@@ -4337,6 +4367,47 @@ mod tests {
 
 		assert_eq!(result.total_matches, 1);
 		assert_eq!(result.files_searched, 1);
+		assert_eq!(result.skipped_oversized, None);
+	}
+
+	/// A named file is streamed, but one line longer than the line-buffer cap
+	/// stops the search there instead of buffering the whole line; matches
+	/// before it are kept and the file is reported as only partly searched.
+	#[cfg(unix)]
+	#[test]
+	fn single_oversized_target_stops_at_a_line_over_the_buffer_cap() {
+		let root = TempDirGuard::new();
+		let big = root.path().join("minified.js");
+		let long_line = "x".repeat(super::MAX_FILE_BYTES as usize + 1024 * 1024);
+		write_file(&big, &format!("needle early\n{long_line}\nneedle late\n"));
+
+		let result = grep_sync(base_grep_config(&big), None, task::CancelToken::default())
+			.expect("an overlong line must not fail the search");
+
+		let lines: Vec<&str> = result.matches.iter().map(|m| m.line.as_str()).collect();
+		assert_eq!(lines, ["needle early"]);
+		assert_eq!(result.files_searched, 1);
+		assert_eq!(result.skipped_oversized, Some(1));
+	}
+
+	/// `filesWithMatches` on a streamed file reports one matching file, as the
+	/// same search on a small file does.
+	#[cfg(unix)]
+	#[test]
+	fn single_oversized_target_files_mode_counts_the_file_once() {
+		let root = TempDirGuard::new();
+		let big = root.path().join("big.txt");
+		write_oversized_file(&big, "needle one\nneedle two\nneedle three\n");
+		let mut config = base_grep_config(&big);
+		config.mode = Some(GrepOutputMode::FilesWithMatches);
+
+		let result = grep_sync(config, None, task::CancelToken::default())
+			.expect("single-file grep should succeed");
+
+		assert_eq!(result.matches.len(), 1);
+		assert_eq!(result.total_matches, 1);
+		assert_eq!(result.files_with_matches, 1);
+		assert_eq!(result.limit_reached, None);
 		assert_eq!(result.skipped_oversized, None);
 	}
 }
