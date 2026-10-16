@@ -1,0 +1,111 @@
+// Evaluated over CDP in every new worker realm before its script runs (see
+// patchWorkersBeforeStart in launch.ts). Dedicated workers inherit the page's UA
+// override but keep the host `navigator.platform`; shared and service workers keep
+// the host `HeadlessChrome` UA and UA-CH too until the browser-side override
+// reaches them. `identity` is the stealth override: `{ userAgent, platform, uaData }`.
+// A realm whose UA is neither the host's nor the stealth one belongs to a tab with
+// device emulation and is left as the page left it. Pages and repeated evaluations
+// are no-ops.
+identity => {
+	if (typeof WorkerGlobalScope === "undefined" || !(self instanceof WorkerGlobalScope)) return;
+	const nav = self.navigator;
+	if (!nav) return;
+	const defineProperty = Object.defineProperty;
+	const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+	const getPrototypeOf = Object.getPrototypeOf;
+	const Reflect_apply = Reflect.apply;
+	const Promise_then = Promise.prototype.then;
+	const nativeFunctionToString = Function.prototype.toString;
+	const nativeSources = new WeakMap();
+	const WeakMap_get = WeakMap.prototype.get;
+	const WeakMap_has = WeakMap.prototype.has;
+	const WeakMap_set = WeakMap.prototype.set;
+	let patched = false;
+
+	// Replaces `owner[prop]` on its prototype-chain owner; `wrap(native, receiver, args)`
+	// computes the new result from the native accessor or method.
+	const patch = (target, prop, kind, wrap) => {
+		let owner = target;
+		let descriptor;
+		while (owner && !(descriptor = getOwnPropertyDescriptor(owner, prop))) owner = getPrototypeOf(owner);
+		const native = descriptor && (kind === "get" ? descriptor.get : descriptor.value);
+		if (!descriptor || !descriptor.configurable || typeof native !== "function") return;
+		// Accessor and method shorthand give the replacement the native name, arity,
+		// and non-constructibility; calling `native` keeps its receiver check.
+		const replacement =
+			kind === "get"
+				? getOwnPropertyDescriptor(
+						{
+							get [prop]() {
+								return wrap(native, this, []);
+							},
+						},
+						prop,
+					).get
+				: native.length === 1
+					? {
+							[prop](arg) {
+								return wrap(native, this, arguments.length ? [arg] : []);
+							},
+						}[prop]
+					: {
+							[prop]() {
+								return wrap(native, this, []);
+							},
+						}[prop];
+		Reflect_apply(WeakMap_set, nativeSources, [
+			replacement,
+			"function " + (kind === "get" ? "get " : "") + prop + "() { [native code] }",
+		]);
+		defineProperty(owner, prop, { ...descriptor, [kind === "get" ? "get" : "value"]: replacement });
+		patched = true;
+	};
+
+	// Nothing is patched yet, so these reads see the realm's native identity.
+	const nativeUserAgent = String(nav.userAgent);
+	const hostUserAgent = nativeUserAgent.includes("HeadlessChrome/");
+	if (!hostUserAgent && nativeUserAgent !== identity.userAgent) return;
+	const replaceGetter = (target, prop, value) =>
+		patch(target, prop, "get", (native, receiver) => {
+			Reflect_apply(native, receiver, []);
+			return value;
+		});
+	if (hostUserAgent) replaceGetter(nav, "userAgent", identity.userAgent);
+	if (nav.platform !== identity.platform) replaceGetter(nav, "platform", identity.platform);
+
+	const uaData = identity.uaData;
+	let data;
+	try {
+		data = nav.userAgentData;
+	} catch {}
+	if (data && data.platform !== uaData.platform) {
+		const spoof = values => {
+			for (const key of ["platform", "platformVersion", "architecture", "bitness", "model"]) {
+				if (values && key in values && key in uaData) values[key] = uaData[key];
+			}
+			return values;
+		};
+		patch(data, "platform", "get", (native, receiver) => {
+			Reflect_apply(native, receiver, []);
+			return uaData.platform;
+		});
+		patch(data, "getHighEntropyValues", "value", (native, receiver, args) =>
+			Reflect_apply(Promise_then, Reflect_apply(native, receiver, args), [spoof]),
+		);
+		patch(data, "toJSON", "value", (native, receiver) => spoof(Reflect_apply(native, receiver, [])));
+	}
+
+	if (!patched) return;
+	const toStringDescriptor = getOwnPropertyDescriptor(Function.prototype, "toString");
+	if (!toStringDescriptor || !toStringDescriptor.configurable) return;
+	const functionToString = new Proxy(nativeFunctionToString, {
+		apply(target, thisArg, args) {
+			if (Reflect_apply(WeakMap_has, nativeSources, [thisArg])) {
+				return Reflect_apply(WeakMap_get, nativeSources, [thisArg]);
+			}
+			return Reflect_apply(target, thisArg, args);
+		},
+	});
+	Reflect_apply(WeakMap_set, nativeSources, [functionToString, "function toString() { [native code] }"]);
+	defineProperty(Function.prototype, "toString", { ...toStringDescriptor, value: functionToString });
+}

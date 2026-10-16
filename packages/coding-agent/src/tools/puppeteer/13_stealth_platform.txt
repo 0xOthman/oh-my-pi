@@ -1,0 +1,57 @@
+// CDP's per-session platform override is reverted whenever any session that set
+// it detaches, leaving `navigator.platform` at the host value while the UA string
+// keeps the spoofed OS. Derive the platform from the active UA so they agree.
+// Patch unconditionally: at document start the native getter can still report
+// the override and only revert later.
+const platformName = "platform";
+let platformProto = Object_getPrototypeOf(navigator);
+let platformOwner;
+let platformDescriptor;
+
+while (platformProto && !platformDescriptor) {
+	platformDescriptor = Object_getOwnPropertyDescriptor(platformProto, platformName);
+	if (platformDescriptor) {
+		platformOwner = platformProto;
+	} else {
+		platformProto = Object_getPrototypeOf(platformProto);
+	}
+}
+
+let platformValue;
+try {
+	const platformUserAgent = String(navigator.userAgent || "");
+	if (platformUserAgent.includes("Windows")) {
+		platformValue = "Win32";
+	} else if (platformUserAgent.includes("Macintosh")) {
+		platformValue = "MacIntel";
+	}
+} catch {}
+
+const shouldPatchPlatform = Boolean(
+	platformValue &&
+		platformOwner &&
+		platformDescriptor &&
+		platformDescriptor.configurable &&
+		typeof platformDescriptor.get === "function",
+);
+
+if (shouldPatchPlatform) {
+	const platformAccessors = {
+		get platform() {
+			Reflect_apply(platformDescriptor.get, this, []);
+			return platformValue;
+		},
+	};
+	const getPlatform = Object_getOwnPropertyDescriptor(platformAccessors, platformName).get;
+
+	if (typeof patchToString === "function") {
+		patchToString(getPlatform, "get platform");
+	}
+
+	Object_defineProperty(platformOwner, platformName, {
+		get: getPlatform,
+		set: platformDescriptor.set,
+		enumerable: platformDescriptor.enumerable,
+		configurable: platformDescriptor.configurable,
+	});
+}

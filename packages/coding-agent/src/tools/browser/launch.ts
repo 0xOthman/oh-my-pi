@@ -36,7 +36,8 @@ import stealthLocaleScript from "../puppeteer/09_stealth_locale.txt" with { type
 import stealthPluginsScript from "../puppeteer/10_stealth_plugins.txt" with { type: "text" };
 import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { type: "text" };
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
-import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
+import stealthPlatformScript from "../puppeteer/13_stealth_platform.txt" with { type: "text" };
+import stealthWorkerNavigatorScript from "../puppeteer/stealth_worker_navigator.txt" with { type: "text" };
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withDownload } from "../../downloads/activity";
 
@@ -90,9 +91,15 @@ function stealthIgnoreDefaultArgs(executablePath: string | undefined): string[] 
 }
 
 const STEALTH_ACCEPT_LANGUAGE = "en-US,en";
+// UA-CH platformVersion Chrome reports on Windows 11 24H2. The frozen UA string says
+// "Windows NT 10.0" for every Windows release, so it cannot supply this value.
+const WINDOWS_UA_CH_PLATFORM_VERSION = "19.0.0";
 
 const USER_AGENT_TARGET_TIMEOUT_MS = 5_000;
 const USER_AGENT_TARGET_TYPES = new Set(["page", "webview", "background_page"]);
+// Browser-level workers do not inherit a page's UA override, and a one-shot session's
+// override reverts on detach, so only the long-lived auto-attach session covers them.
+const USER_AGENT_WORKER_TARGET_TYPES: Record<string, true> = { shared_worker: true, service_worker: true };
 
 /**
  * Lazy-import puppeteer while hiding the user's cwd from cosmiconfig. The
@@ -787,7 +794,9 @@ function resolveHostBitness(): string {
 async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> {
 	const rawUserAgent = await page.browser().userAgent();
 	let userAgent = rawUserAgent.replace("HeadlessChrome/", "Chrome/");
-	if (userAgent.includes("Linux") && !userAgent.includes("Android")) {
+	// Desktop Linux is rewritten to the frozen Windows x64 UA, so UA-CH must report x86 even on arm64 hosts.
+	const spoofedWindows = userAgent.includes("Linux") && !userAgent.includes("Android");
+	if (spoofedWindows) {
 		userAgent = userAgent.replace(/\(([^)]+)\)/, "(Windows NT 10.0; Win64; x64)");
 	}
 
@@ -806,9 +815,9 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 		: userAgent.includes("Android ")
 			? (userAgent.match(/Android ([^;]+)/)?.[1] ?? "")
 			: isWindows
-				? (userAgent.match(/Windows NT ([\d.]+)/)?.[1] ?? "")
+				? WINDOWS_UA_CH_PLATFORM_VERSION
 				: "";
-	const architecture = isAndroid ? "" : resolveHostArchitecture();
+	const architecture = isAndroid ? "" : spoofedWindows ? "x86" : resolveHostArchitecture();
 	const bitness = isAndroid ? "" : resolveHostBitness();
 	const model = isAndroid ? (userAgent.match(/Android.*?;\s([^)]+)/)?.[1] ?? "") : "";
 
@@ -889,6 +898,7 @@ async function configureUserAgentTargets(
 ): Promise<void> {
 	if (!state.browserSession) {
 		state.browserSession = await browser.target().createCDPSession();
+		patchWorkersBeforeStart(state.browserSession, state.override);
 		await state.browserSession.send("Target.setAutoAttach", {
 			autoAttach: true,
 			waitForDebuggerOnStart: false,
@@ -897,7 +907,8 @@ async function configureUserAgentTargets(
 		state.browserSession.on(
 			"Target.attachedToTarget",
 			async (event: { sessionId: string; targetInfo?: { type?: string } }) => {
-				if (!targetInfoSupportsUserAgentOverride(event.targetInfo)) return;
+				const type = event.targetInfo?.type;
+				if (!type || !(USER_AGENT_TARGET_TYPES.has(type) || USER_AGENT_WORKER_TARGET_TYPES[type])) return;
 				const connection = state.browserSession?.connection();
 				const session = connection?.session(event.sessionId);
 				if (!session) return;
@@ -928,6 +939,29 @@ function targetSupportsUserAgentOverride(target: Target): boolean {
 
 function targetInfoSupportsUserAgentOverride(targetInfo: { type?: string } | undefined): boolean {
 	return Boolean(targetInfo?.type && USER_AGENT_TARGET_TYPES.has(targetInfo.type));
+}
+
+/**
+ * Every worker keeps the host `navigator.platform`, and shared/service workers also
+ * report the host UA and UA-CH until the long-lived session's override reaches them,
+ * so a script patches those values in each new worker realm. Puppeteer attaches every
+ * new target paused (`waitForDebuggerOnStart`) and resumes it from its
+ * `Target.attachedToTarget` handler. The connection emits `sessionattached` before
+ * dispatching that event and a session runs commands in order, so the evaluate lands
+ * before the worker's script. The handler cannot see the target type, so it must not
+ * send overrides here: page sessions would clobber device emulation.
+ */
+function patchWorkersBeforeStart(browserSession: CDPSession, override: UserAgentOverride): void {
+	const identity = {
+		userAgent: override.userAgent,
+		platform: override.platform,
+		uaData: override.userAgentMetadata,
+	};
+	const expression = `(${stealthWorkerNavigatorScript})(${JSON.stringify(identity)})`;
+	browserSession.connection()?.on("sessionattached", session => {
+		// The script ignores non-worker realms; targets without a Runtime domain (tabs) reject.
+		session.send("Runtime.evaluate", { expression }).catch(() => undefined);
+	});
 }
 
 async function applyTargetUserAgentOverride(target: Target, override: UserAgentOverride): Promise<void> {
@@ -974,7 +1008,7 @@ const STEALTH_PATCH_SCRIPTS = [
 	stealthPluginsScript,
 	stealthHardwareScript,
 	stealthCodecsScript,
-	stealthWorkerScript,
+	stealthPlatformScript,
 ];
 
 function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_SCRIPTS): string {
