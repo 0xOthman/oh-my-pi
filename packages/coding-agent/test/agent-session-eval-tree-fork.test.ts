@@ -129,22 +129,19 @@ it("keeps the tree-navigation eval context in the fork's provider prefix", async
 	expect(shape(fork.messages)).toEqual(shape(session.messages));
 });
 
-it("reuses the persisted eval snapshot when navigating back to the same point", async () => {
-	const { manager, jumpTarget, latest } = await setup();
+it("reloads onto the eval branch after jumping back to an already snapshotted point", async () => {
+	const { manager, open, jumpTarget, latest } = await setup();
 	if (!session) throw new Error("Expected a session");
 
 	await session.navigateTree(jumpTarget);
-	const snapshotId = manager.getLeafId();
-	if (snapshotId === null || snapshotId === jumpTarget) throw new Error("Expected a persisted eval snapshot");
 	await session.navigateTree(latest);
 	await session.navigateTree(jumpTarget);
 
-	const snapshots = manager
-		.getChildren(jumpTarget)
-		.filter(entry => entry.type === "message" && entry.message.role === "custom");
-	expect(snapshots.map(entry => entry.id)).toEqual([snapshotId]);
-	expect(manager.getLeafId()).toBe(snapshotId);
-	expect(shape(session.messages)).toEqual(shape(manager.buildSessionContext().messages));
+	const file = session.sessionFile;
+	if (!file) throw new Error("Expected a persisted session");
+	await manager.flush();
+	fork = open(await SessionManager.open(file, path.join(temp.path(), "sessions")));
+	expect(shape(fork.messages)).toEqual(shape(session.messages));
 });
 
 it("corrects a live-kernel snapshot persisted on a pre-eval branch after a fresh-process reload", async () => {

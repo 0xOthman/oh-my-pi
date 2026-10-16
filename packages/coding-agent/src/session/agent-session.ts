@@ -6667,28 +6667,15 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Writes the eval runtime snapshot `navigateTree` adds to `context` into the
 	 * session file at the new leaf, so a fork or reload of this branch rebuilds
-	 * the live request prefix (#15933). Re-navigating to the same point reuses an
-	 * identical snapshot child instead of growing a sibling per jump. Returns
+	 * the live request prefix (#15933). Always a fresh append, even when the
+	 * target already has an identical snapshot child: the leaf is restored from
+	 * the last journal entry, so only an append makes the jump durable. Returns
 	 * whether the leaf moved.
 	 */
 	#persistNavigationEvalStateContext(context: SessionContext): boolean {
 		const snapshot = this.#buildEvalStateContextMessage();
 		if (!snapshot || !this.#needsEvalStateContext(context.messages, snapshot.content)) return false;
-		const leafId = this.sessionManager.getLeafId();
-		const existing =
-			leafId === null
-				? undefined
-				: this.sessionManager
-						.getChildren(leafId)
-						.find(
-							entry =>
-								entry.type === "message" &&
-								entry.message.role === "custom" &&
-								entry.message.customType === "eval-state-context" &&
-								entry.message.content === snapshot.content,
-						);
-		if (existing) this.sessionManager.branch(existing.id);
-		else this.sessionManager.appendMessage(snapshot);
+		this.sessionManager.appendMessage(snapshot);
 		return true;
 	}
 
