@@ -929,13 +929,28 @@ async function configureUserAgentTargets(
 		state.browserSession.connection()?.on("sessiondetached", session => state.worker?.targets.delete(session));
 		state.browserSession.on(
 			"Target.attachedToTarget",
-			async (event: { sessionId: string; targetInfo?: { type?: string; url?: string } }) => {
+			async (event: {
+				sessionId: string;
+				targetInfo?: { type?: string; url?: string };
+				waitingForDebugger?: boolean;
+			}) => {
 				const type = event.targetInfo?.type;
 				const connection = state.browserSession?.connection();
 				const session = connection?.session(event.sessionId);
 				if (!session) return;
 				try {
-					if (!type || !USER_AGENT_WORKER_TARGET_TYPES[type]) return;
+					if (!type) return;
+					// Pages opened after setup (popups, new tabs) start paused; existing pages,
+					// including this tab's own, keep the overrides their owners applied.
+					if (USER_AGENT_TARGET_TYPES.has(type)) {
+						if (!event.waitingForDebugger) return;
+						const applied = sendUserAgentOverride(wrapSession(session), state.override, {
+							queueBeforeStart: true,
+						});
+						await withSoftTimeout(applied, targetTimeoutMs, "new target user-agent override");
+						return;
+					}
+					if (!USER_AGENT_WORKER_TARGET_TYPES[type]) return;
 					const worker = state.worker;
 					const url = event.targetInfo?.url ?? "";
 					worker?.targets.set(session, url);

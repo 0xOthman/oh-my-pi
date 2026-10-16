@@ -312,4 +312,30 @@ return await tab.evaluate(async () => {
 			await prelude.invoke({ action: "close", name: "platform-dedicated" }, context);
 		}
 	}, 60_000);
+
+	it("gives a popup opened after setup the stealth identity", async () => {
+		await prelude.invoke({ action: "open", name: "platform-popup", url: pageUrl }, context);
+		try {
+			const { page, popup } = await runInTab<{
+				page: ContextIdentity;
+				popup: ContextIdentity & { request: string };
+			}>(
+				"platform-popup",
+				`return await tab.evaluate(async () => {
+	const popup = window.open("/popup/");
+	await new Promise(resolve => popup.addEventListener("load", resolve, { once: true }));
+	const report = {
+		...${REPORT.replaceAll("navigator", "popup.navigator")},
+		request: await (await popup.fetch("/ua")).text(),
+	};
+	popup.close();
+	return { page: ${REPORT}, popup: report };
+});`,
+			);
+			expect(page.userAgent).toContain("Windows");
+			expect(popup).toEqual({ ...page, request: page.userAgent });
+		} finally {
+			await prelude.invoke({ action: "close", name: "platform-popup" }, context);
+		}
+	}, 60_000);
 });
