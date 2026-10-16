@@ -6708,6 +6708,10 @@ export class AgentSession implements SettingsScope {
 			if (message.role === "pythonExecution" || (message.role === "toolResult" && message.toolName === "eval")) {
 				return true;
 			}
+			// A persisted snapshot (e.g. written by `/tree` onto a pre-eval branch) may
+			// describe a kernel this process no longer has; count it as history so a
+			// fresh registry emits the "not restored" correction after it.
+			if (message.role === "custom" && message.customType === "eval-state-context") return true;
 			return (
 				message.role === "assistant" &&
 				message.content.some(block => block.type === "toolCall" && block.name === "eval")
