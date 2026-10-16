@@ -1,19 +1,18 @@
 /**
  * Cascade search: semantic passage maps before full-source reading.
  *
- * 1. Lexical scan ranks every eligible file by query keywords.
- * 2. Filename ranking judges the top candidates by name and place in the tree.
- * 3. Passage scoring reads the strongest files, cuts them into byte-bounded
- *    windows, and judges a budgeted verbatim sketch of each window.
- * 4. Verification judges the complete text of the sketches that survived.
+ * Directory searches rank files lexically and by name, sketch selected
+ * windows, then verify full passages that survive the sketch gate. Explicit
+ * file searches verify every passage directly; files beyond the read limit
+ * or with unjudgeably long lines fail instead of reporting an incomplete miss.
  *
  * Sketch judgments are only routing signals: a reported heat range always
  * comes from a complete passage. Each judged phase runs its requests through
- * a bounded-parallel dispatcher and drains fully before the next begins, so
- * the critical path is three dependent waves.
+ * a bounded-parallel dispatcher and drains fully before the next begins.
  */
 import * as path from "node:path";
 import type { Judge, JudgmentResult, NoulQuestion } from "@oh-my-pi/pi-ai";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { FindHit, FindStats } from "@oh-my-pi/pi-tui/tools/find";
 import type { InternalUrlFilesystem } from "../../internal-urls/url-filesystem";
 import { throwIfAborted } from "../tool-errors";
@@ -192,43 +191,51 @@ class Cascade {
 			.slice(0, CANDIDATES);
 		const nameScore = Array.from<number | undefined>({ length: entries.length });
 
-		// Wave 1: filename ranking over the lexical shortlist.
-		const project = path.basename(root.path);
-		const nameJobs = chunks(
-			ranked.map(candidate => candidate.node),
-			NAME_BATCH,
-		).map(batch => ({
-			batch,
-			request: nameBatch(
-				project,
-				query,
-				batch.map(node => entries[node]!),
-			),
-		}));
-		let named = 0;
-		onProgress?.(`filename ranking 0/${ranked.length}`);
-		await this.#dispatch(nameJobs, (job, outcome) => {
-			named += job.batch.length;
-			if (!outcome.ok) this.#fail("filenames", outcome.error);
-			job.batch.forEach((node, k) => {
-				const p = noul(outcome, entryKey(k));
-				nameScore[node] = p;
-				if (p === undefined) {
-					if (outcome.ok) this.stats.errors++;
-				} else {
-					this.stats.judged++;
-				}
+		// A named file needs its content judged, not a filename prior that can
+		// reject the only candidate before its evidence is read.
+		if (root.type === "directory") {
+			const project = path.basename(root.path);
+			const nameJobs = chunks(
+				ranked.map(candidate => candidate.node),
+				NAME_BATCH,
+			).map(batch => ({
+				batch,
+				request: nameBatch(
+					project,
+					query,
+					batch.map(node => entries[node]!),
+				),
+			}));
+			let named = 0;
+			onProgress?.(`filename ranking 0/${ranked.length}`);
+			await this.#dispatch(nameJobs, (job, outcome) => {
+				named += job.batch.length;
+				if (!outcome.ok) this.#fail("filenames", outcome.error);
+				job.batch.forEach((node, k) => {
+					const p = noul(outcome, entryKey(k));
+					nameScore[node] = p;
+					if (p === undefined) {
+						if (outcome.ok) this.stats.errors++;
+					} else {
+						this.stats.judged++;
+					}
+				});
+				onProgress?.(`filename ranking ${named}/${ranked.length}`);
 			});
-			onProgress?.(`filename ranking ${named}/${ranked.length}`);
-		});
+		}
 
-		// The two strongest lexical candidates are read regardless of the name
-		// judgment; the rest of the budget follows name score, then lexical rank.
-		const selected = ranked.slice(0, Math.min(FILES, 2)).map(candidate => candidate.node);
-		ranked.sort((a, b) => (nameScore[b.node] ?? 0) - (nameScore[a.node] ?? 0) || b.lex - a.lex);
-		for (const candidate of ranked) {
-			if (selected.length >= FILES) break;
-			if (!selected.includes(candidate.node)) selected.push(candidate.node);
+		// The two strongest lexical directory candidates are read regardless
+		// of name judgment; the rest follow name score, then lexical rank.
+		const selected =
+			root.type === "file"
+				? ranked.map(candidate => candidate.node)
+				: ranked.slice(0, Math.min(FILES, 2)).map(candidate => candidate.node);
+		if (root.type === "directory") {
+			ranked.sort((a, b) => (nameScore[b.node] ?? 0) - (nameScore[a.node] ?? 0) || b.lex - a.lex);
+			for (const candidate of ranked) {
+				if (selected.length >= FILES) break;
+				if (!selected.includes(candidate.node)) selected.push(candidate.node);
+			}
 		}
 		onProgress?.(`reading ${selected.length} files`);
 		const plans = await Promise.all(
@@ -236,10 +243,25 @@ class Cascade {
 				const entry = entries[node]!;
 				try {
 					const read = await readText(filesystem, entry.path, READ_LIMIT);
-					const passages = selectWindows(windows(read.text, WINDOW_BYTES, keywords, weights), WINDOWS);
+					if (root.type === "file" && read.truncated) {
+						throw new ToolError("find cannot judge the whole explicit file: exceeds the 4 MiB read limit");
+					}
+					const all = windows(read.text, WINDOW_BYTES, keywords, weights);
+					if (root.type === "file" && all.some(passage => passage.truncated)) {
+						throw new ToolError(
+							"find cannot judge the whole explicit file: a line exceeds the 8 KiB passage limit",
+						);
+					}
+					const passages = root.type === "file" ? all : selectWindows(all, WINDOWS);
 					if (passages.length === 0) return undefined;
-					return { node, total: lines(read.text).length, truncated: read.truncated, passages };
+					return {
+						node,
+						total: lines(read.text).length,
+						truncated: read.truncated || passages.some(passage => passage.truncated),
+						passages,
+					};
 				} catch (error) {
+					if (error instanceof ToolError) throw error;
 					// Binary and blank files are expected misses, not failures worth reporting.
 					if (!(error instanceof ReadTextError) || error.kind === "io") this.#fail(`read ${entry.rel}`, error);
 					return undefined;
@@ -248,42 +270,52 @@ class Cascade {
 		);
 		const files = plans.filter((plan): plan is FilePlan => plan !== undefined);
 
-		// Wave 2: sketch routing over mixed-file cards.
-		const cards: { f: number; p: number }[] = [];
-		files.forEach((plan, f) => plan.passages.forEach((_, p) => cards.push({ f, p })));
-		let sketchSentBytes = 0;
-		const sketchJobs = chunks(
-			cards,
-			Math.min(SKETCH_CARDS_MAX, Math.max(1, Math.floor(SKETCH_STATE_BYTES / SKETCH_BYTES))),
-		).map(batch => {
-			const sketches: SketchCard[] = batch.map(({ f, p }) => {
-				const text = sketch(files[f]!.passages[p]!, keywords, weights, SKETCH_BYTES);
-				sketchSentBytes += Buffer.byteLength(text);
-				return { fileKey: `f${f}`, rel: entries[files[f]!.node]!.rel, sketch: text };
-			});
-			return { batch, request: sketchBatch(query, sketches) };
-		});
-		this.stats.mapCards += cards.length;
-		onProgress?.(`scoring ${cards.length} passage sketches across ${files.length} files`);
+		// Directory searches use sketches to route a bounded subset. An
+		// explicit file skips that lossy gate and verifies every read passage.
 		const candidates: { f: number; p: number; score: number }[] = [];
-		await this.#dispatch(sketchJobs, (job, outcome) => {
-			if (!outcome.ok) this.#fail("sketches", outcome.error);
-			job.batch.forEach(({ f, p }, k) => {
-				const score = noul(outcome, passageKey(k));
-				if (score === undefined && outcome.ok) this.stats.errors++;
-				// Failure is unknown, never grounds for a negative judgment.
-				candidates.push({ f, p, score: score ?? 1 });
+		let sketchSentBytes = 0;
+		if (root.type === "file") {
+			files.forEach((plan, f) => plan.passages.forEach((_, p) => candidates.push({ f, p, score: 1 })));
+		} else {
+			const cards: { f: number; p: number }[] = [];
+			files.forEach((plan, f) => plan.passages.forEach((_, p) => cards.push({ f, p })));
+			const sketchJobs = chunks(
+				cards,
+				Math.min(SKETCH_CARDS_MAX, Math.max(1, Math.floor(SKETCH_STATE_BYTES / SKETCH_BYTES))),
+			).map(batch => {
+				const sketches: SketchCard[] = batch.map(({ f, p }) => {
+					const text = sketch(files[f]!.passages[p]!, keywords, weights, SKETCH_BYTES);
+					sketchSentBytes += Buffer.byteLength(text);
+					return { fileKey: `f${f}`, rel: entries[files[f]!.node]!.rel, sketch: text };
+				});
+				return { batch, request: sketchBatch(query, sketches) };
 			});
-		});
-		candidates.sort(
-			(a, b) =>
-				b.score - a.score ||
-				files[b.f]!.passages[b.p]!.score - files[a.f]!.passages[a.p]!.score ||
-				compareRel(entries[files[a.f]!.node]!, entries[files[b.f]!.node]!) ||
-				files[a.f]!.passages[a.p]!.start - files[b.f]!.passages[b.p]!.start,
-		);
-		const survivors = candidates.filter(candidate => candidate.score >= CUTOFF).slice(0, FULL_LIMIT);
-		this.stats.windowsPruned += cards.length - survivors.length;
+			this.stats.mapCards += cards.length;
+			onProgress?.(`scoring ${cards.length} passage sketches across ${files.length} files`);
+			await this.#dispatch(sketchJobs, (job, outcome) => {
+				if (!outcome.ok) this.#fail("sketches", outcome.error);
+				job.batch.forEach(({ f, p }, k) => {
+					const score = noul(outcome, passageKey(k));
+					if (score === undefined && outcome.ok) this.stats.errors++;
+					// Failure is unknown, never grounds for a negative judgment.
+					candidates.push({ f, p, score: score ?? 1 });
+				});
+			});
+		}
+		if (root.type === "directory") {
+			candidates.sort(
+				(a, b) =>
+					b.score - a.score ||
+					files[b.f]!.passages[b.p]!.score - files[a.f]!.passages[a.p]!.score ||
+					compareRel(entries[files[a.f]!.node]!, entries[files[b.f]!.node]!) ||
+					files[a.f]!.passages[a.p]!.start - files[b.f]!.passages[b.p]!.start,
+			);
+		}
+		const survivors =
+			root.type === "file"
+				? candidates
+				: candidates.filter(candidate => candidate.score >= CUTOFF).slice(0, FULL_LIMIT);
+		this.stats.windowsPruned += candidates.length - survivors.length;
 		const chosen = new Map<number, number[]>();
 		for (const { f, p } of survivors) {
 			const list = chosen.get(f);

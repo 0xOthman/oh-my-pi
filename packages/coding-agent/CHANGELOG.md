@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Fixed `find` missing relevant text in an explicitly named file; files or lines too large to judge completely now report an error instead of a clean miss ([#16027](https://github.com/can1357/oh-my-pi/issues/16027)).
 - Fixed the Isolate Subagents setting description implying that all tasks run isolated; each task must opt in with `isolated: true` ([#15987](https://github.com/can1357/oh-my-pi/issues/15987)).
 - Fixed `read` labeling re-encoded images with the display format instead of the source file's format; it now identifies both when they differ ([#15890](https://github.com/can1357/oh-my-pi/issues/15890)).
 - Fixed `omp -p` and `task` subagents reporting a clean finish with an earlier answer when a context overflow could not be compacted enough to retry; the overflow error is now the run's outcome ([#15897](https://github.com/can1357/oh-my-pi/pull/15897) by [@nhthung](https://github.com/nhthung))

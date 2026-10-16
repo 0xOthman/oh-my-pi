@@ -14,6 +14,8 @@ export interface Passage {
 	text: string;
 	/** Lexical score used for window selection and tie-breaking. */
 	score: number;
+	/** A single line exceeded the window budget and was clipped. */
+	truncated?: boolean;
 }
 
 /** A judged line range with its yes-probability and a one-line preview; the shape the renderer consumes. */
@@ -37,12 +39,17 @@ export function windows(
 		let end = start;
 		let content = "";
 		let used = 0;
+		let truncated = false;
 		while (end < source.length) {
 			const line = source[end]!;
 			const prefix = `L${end + 1}| `;
+			const lineBytes = Buffer.byteLength(line);
 			const overhead = prefix.length + 1;
-			if (end > start && used + Buffer.byteLength(line) + overhead > bytes) break;
-			const piece = `${prefix}${clipBytes(line, Math.max(0, bytes - (used + overhead)))}\n`;
+			if (end > start && used + lineBytes + overhead > bytes) break;
+			const available = Math.max(0, bytes - (used + overhead));
+			const clipped = lineBytes <= available ? line : clipBytes(line, available);
+			if (clipped.length !== line.length) truncated = true;
+			const piece = `${prefix}${clipped}\n`;
 			content += piece;
 			used += Buffer.byteLength(piece);
 			end++;
@@ -53,7 +60,7 @@ export function windows(
 		for (let k = 0; k < keywords.length; k++) {
 			score += weights[k]! * Math.log1p(countOccurrences(lower, keywords[k]!));
 		}
-		passages.push({ start: start + 1, end, text: content, score });
+		passages.push({ start: start + 1, end, text: content, score, truncated });
 		start = end;
 	}
 	return passages;
