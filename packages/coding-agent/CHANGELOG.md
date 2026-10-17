@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added an opt-in Windows extension example for Arabic letter joining and bidirectional display in the transcript and composer.
+- Added an opt-in Windows extension example for Arabic letter joining and bidirectional display in the transcript and composer ([#16083](https://github.com/can1357/oh-my-pi/pull/16083) by [@0xOthman](https://github.com/0xOthman)).
 
 ### Changed
 
