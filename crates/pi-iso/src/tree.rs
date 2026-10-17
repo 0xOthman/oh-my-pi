@@ -95,14 +95,23 @@ pub trait TreeCopy {
 	fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()>;
 }
 
-/// Copies the entries of the directory `src` into the existing directory
-/// `dst`, recursing into subdirectories. Top-level entries named in `skip` are
-/// left out; the dispatch uses the directory listing's file types, so
-/// symlinks are never followed.
+/// Directory filters for a single copy walk.
+#[derive(Clone, Copy)]
+pub struct CopyOptions<'a> {
+	/// Entry names omitted at the walk root.
+	pub skip:              &'a [&'a OsStr],
+	/// Exclude nested directories with Git metadata.
+	pub skip_nested_repos: bool,
+	/// Absolute destination under the source, if any.
+	pub excluded:          Option<&'a Path>,
+}
+
+/// Copies the entries of `src` into `dst` without following symlinks.
+/// Root entries and nested repositories selected by `options` are omitted.
 pub fn copy_dir_contents(
 	src: &Path,
 	dst: &Path,
-	skip: &[&OsStr],
+	options: CopyOptions<'_>,
 	copy: &impl TreeCopy,
 ) -> IsoResult<()> {
 	let entries = fs::read_dir(src)
@@ -111,7 +120,7 @@ pub fn copy_dir_contents(
 		let entry =
 			entry.map_err(|err| IsoError::other(format!("dir entry in {}: {err}", src.display())))?;
 		let name = entry.file_name();
-		if skip.contains(&name.as_os_str()) {
+		if options.skip.contains(&name.as_os_str()) {
 			continue;
 		}
 		let src_path = entry.path();
@@ -122,13 +131,134 @@ pub fn copy_dir_contents(
 		if file_type.is_symlink() {
 			copy.symlink(&src_path, &dst_path, file_type)?;
 		} else if file_type.is_dir() {
+			if options.excluded == Some(src_path.as_path())
+				|| (options.skip_nested_repos
+					&& fs::symlink_metadata(src_path.join(".git"))
+						.is_ok_and(|meta| meta.is_file() || meta.is_dir()))
+			{
+				continue;
+			}
 			fs::create_dir_all(&dst_path)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", dst_path.display())))?;
-			copy_dir_contents(&src_path, &dst_path, &[], copy)?;
+			copy_dir_contents(&src_path, &dst_path, CopyOptions { skip: &[], ..options }, copy)?;
 			copy.finish_dir(&src_path, &dst_path)?;
 		} else {
 			copy.file(&src_path, &dst_path, file_type)?;
 		}
 	}
 	Ok(())
+}
+
+/// Finds an in-source clone destination before it can be copied recursively.
+/// Call before clearing the destination: it also rejects cloning onto an
+/// ancestor of the source.
+pub fn clone_excluded_path(lower: &Path, merged: &Path) -> IsoResult<Option<PathBuf>> {
+	let parent = merged
+		.parent()
+		.ok_or_else(|| IsoError::other("clone destination has no parent"))?;
+	fs::create_dir_all(parent)
+		.map_err(|err| IsoError::other(format!("create parent of {}: {err}", merged.display())))?;
+	let dest = fs::canonicalize(parent)
+		.map_err(|err| IsoError::other(format!("canonicalize {}: {err}", parent.display())))?
+		.join(
+			merged
+				.file_name()
+				.ok_or_else(|| IsoError::other("clone destination has no name"))?,
+		);
+	if lower.starts_with(&dest) {
+		return Err(IsoError::other("clone destination contains the source"));
+	}
+	Ok(dest.starts_with(lower).then_some(dest))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct Copy;
+
+	impl TreeCopy for Copy {
+		fn symlink(&self, _: &Path, _: &Path, _: FileType) -> IsoResult<()> {
+			unreachable!()
+		}
+
+		fn file(&self, src: &Path, dst: &Path, _: FileType) -> IsoResult<()> {
+			fs::copy(src, dst).map_err(|err| IsoError::other(err.to_string()))?;
+			Ok(())
+		}
+
+		fn finish_dir(&self, _: &Path, _: &Path) -> IsoResult<()> {
+			Ok(())
+		}
+	}
+
+	fn fixture() -> (PathBuf, PathBuf, PathBuf) {
+		let root = std::env::temp_dir().join(format!(
+			"pi-iso-clone-walk-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		let source = root.join("source");
+		let target = root.join("target");
+		fs::create_dir_all(&source).unwrap();
+		(root, source, target)
+	}
+
+	#[test]
+	fn clone_walk_does_not_copy_linked_worktrees() {
+		let (root, source, target) = fixture();
+		fs::create_dir_all(source.join(".worktrees/a")).unwrap();
+		fs::create_dir_all(source.join("vendor/repo/.git")).unwrap();
+		fs::create_dir_all(source.join(".worktrees/cache")).unwrap();
+		fs::create_dir_all(source.join(".git")).unwrap();
+		fs::create_dir_all(&target).unwrap();
+		fs::write(source.join(".worktrees/a/.git"), "gitdir: /original/.git/worktrees/a\n").unwrap();
+		fs::write(source.join(".worktrees/cache/artifact"), "cache").unwrap();
+		fs::write(source.join("vendor/repo/.git/config"), "config").unwrap();
+		copy_dir_contents(
+			&source,
+			&target,
+			CopyOptions {
+				skip:              &[OsStr::new(".git")],
+				skip_nested_repos: true,
+				excluded:          None,
+			},
+			&Copy,
+		)
+		.unwrap();
+		assert!(!target.join(".worktrees/a").exists(), "linked worktree was copied");
+		assert!(!target.join("vendor/repo").exists(), "nested repository was copied");
+		assert!(!target.join(".git").exists(), "source registration was copied");
+		assert_eq!(fs::read_to_string(target.join(".worktrees/cache/artifact")).unwrap(), "cache");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn clone_walk_excludes_destination_nested_in_source() {
+		let (root, source, _) = fixture();
+		let target = source.join(".worktrees/b");
+		fs::create_dir_all(target.parent().unwrap()).unwrap();
+		fs::write(source.join("file"), "checkout").unwrap();
+		fs::write(source.join(".worktrees/cache"), "cache").unwrap();
+		let excluded = clone_excluded_path(&source, &target).unwrap();
+		fs::create_dir(&target).unwrap();
+		copy_dir_contents(
+			&source,
+			&target,
+			CopyOptions {
+				skip:              &[],
+				skip_nested_repos: true,
+				excluded:          excluded.as_deref(),
+			},
+			&Copy,
+		)
+		.unwrap();
+		assert_eq!(fs::read_to_string(target.join("file")).unwrap(), "checkout");
+		assert_eq!(fs::read_to_string(target.join(".worktrees/cache")).unwrap(), "cache");
+		assert!(!target.join(".worktrees/b").exists(), "destination was copied into itself");
+		fs::remove_dir_all(root).unwrap();
+	}
 }

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 #[cfg(not(windows))]
 use crate::IsoError;
-use crate::{BackendKind, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, CloneTreeOptions, IsoResult, IsolationBackend, ProbeResult};
 
 pub struct WindowsBlockCloneBackend;
 
@@ -51,14 +51,19 @@ impl IsolationBackend for WindowsBlockCloneBackend {
 		}
 	}
 
-	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	fn clone_tree(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		options: CloneTreeOptions<'_>,
+	) -> IsoResult<()> {
 		#[cfg(windows)]
 		{
-			imp::clone_tree(lower, merged, skip)
+			imp::clone_tree(lower, merged, options)
 		}
 		#[cfg(not(windows))]
 		{
-			let _ = (lower, merged, skip);
+			let _ = (lower, merged, options);
 			Err(IsoError::unavailable("Windows block-clone isolation is only available on Windows"))
 		}
 	}
@@ -90,21 +95,34 @@ mod imp {
 	};
 
 	use crate::{
-		IsoError, IsoResult, cow,
-		tree::{self, TreeCopy},
+		CloneTreeOptions, IsoError, IsoResult, cow,
+		tree::{self, CopyOptions, TreeCopy},
 	};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		clone_tree(lower, merged, &[])
+		clone_tree(lower, merged, CloneTreeOptions {
+			skip:              &[],
+			skip_nested_repos: false,
+		})
 	}
 
-	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	pub fn clone_tree(lower: &Path, merged: &Path, options: CloneTreeOptions<'_>) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "block-clone source", IsoError::other)?;
+		let excluded = tree::clone_excluded_path(&lower, merged)?;
 		tree::prepare_destination(merged, "block clone", remove_path)?;
 		let result = (|| {
 			fs::create_dir_all(merged)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-			tree::copy_dir_contents(&lower, merged, skip, &BlockClone)?;
+			tree::copy_dir_contents(
+				&lower,
+				merged,
+				CopyOptions {
+					skip:              options.skip,
+					skip_nested_repos: options.skip_nested_repos,
+					excluded:          excluded.as_deref(),
+				},
+				&BlockClone,
+			)?;
 			BlockClone.finish_dir(&lower, merged)
 		})();
 		if result.is_err() {

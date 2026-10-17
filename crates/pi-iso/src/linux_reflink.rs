@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 #[cfg(not(target_os = "linux"))]
 use crate::IsoError;
-use crate::{BackendKind, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, CloneTreeOptions, IsoResult, IsolationBackend, ProbeResult};
 
 pub struct LinuxReflinkBackend;
 
@@ -51,14 +51,19 @@ impl IsolationBackend for LinuxReflinkBackend {
 		}
 	}
 
-	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	fn clone_tree(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		options: CloneTreeOptions<'_>,
+	) -> IsoResult<()> {
 		#[cfg(target_os = "linux")]
 		{
-			imp::clone_tree(lower, merged, skip)
+			imp::clone_tree(lower, merged, options)
 		}
 		#[cfg(not(target_os = "linux"))]
 		{
-			let _ = (lower, merged, skip);
+			let _ = (lower, merged, options);
 			Err(IsoError::unavailable("Linux FICLONE reflink isolation is only available on Linux"))
 		}
 	}
@@ -89,21 +94,34 @@ mod imp {
 	};
 
 	use crate::{
-		IsoError, IsoResult, cow,
-		tree::{self, TreeCopy},
+		CloneTreeOptions, IsoError, IsoResult, cow,
+		tree::{self, CopyOptions, TreeCopy},
 	};
 
 	pub fn start(lower: &Path, merged: &Path) -> IsoResult<()> {
-		clone_tree(lower, merged, &[])
+		clone_tree(lower, merged, CloneTreeOptions {
+			skip:              &[],
+			skip_nested_repos: false,
+		})
 	}
 
-	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	pub fn clone_tree(lower: &Path, merged: &Path, options: CloneTreeOptions<'_>) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "reflink source", IsoError::other)?;
+		let excluded = tree::clone_excluded_path(&lower, merged)?;
 		tree::prepare_destination(merged, "reflink clone", tree::remove_existing)?;
 		let result = (|| {
 			fs::create_dir(merged)
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-			tree::copy_dir_contents(&lower, merged, skip, &Reflink)?;
+			tree::copy_dir_contents(
+				&lower,
+				merged,
+				CopyOptions {
+					skip:              options.skip,
+					skip_nested_repos: options.skip_nested_repos,
+					excluded:          excluded.as_deref(),
+				},
+				&Reflink,
+			)?;
 			Reflink.finish_dir(&lower, merged)
 		})();
 		if result.is_err() {

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 
 #[cfg(not(target_os = "macos"))]
 use crate::IsoError;
-use crate::{BackendKind, IsoResult, IsolationBackend, ProbeResult};
+use crate::{BackendKind, CloneTreeOptions, IsoResult, IsolationBackend, ProbeResult};
 
 pub struct ApfsBackend;
 
@@ -50,14 +50,19 @@ impl IsolationBackend for ApfsBackend {
 		}
 	}
 
-	fn clone_tree(&self, lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	fn clone_tree(
+		&self,
+		lower: &Path,
+		merged: &Path,
+		options: CloneTreeOptions<'_>,
+	) -> IsoResult<()> {
 		#[cfg(target_os = "macos")]
 		{
-			imp::clone_tree(lower, merged, skip)
+			imp::clone_tree(lower, merged, options)
 		}
 		#[cfg(not(target_os = "macos"))]
 		{
-			let _ = (lower, merged, skip);
+			let _ = (lower, merged, options);
 			Err(IsoError::unavailable("APFS clonefile isolation is only available on macOS"))
 		}
 	}
@@ -77,12 +82,15 @@ impl IsolationBackend for ApfsBackend {
 
 #[cfg(target_os = "macos")]
 mod imp {
-	use std::{fs, path::Path};
+	use std::{
+		fs::{self, FileTimes, FileType},
+		path::Path,
+	};
 
 	use crate::{
-		IsoError, IsoResult,
+		CloneTreeOptions, IsoError, IsoResult,
 		cow::{self, CLONE_NOFOLLOW},
-		tree,
+		tree::{self, CopyOptions, TreeCopy},
 	};
 
 	/// Classifies a failed `clonefile` of `src` to `dst`.
@@ -115,13 +123,9 @@ mod imp {
 		cow::clonefile(&lower, merged, 0).map_err(|err| clone_error(&lower, merged, &err))
 	}
 
-	pub fn clone_tree(lower: &Path, merged: &Path, skip: &[&std::ffi::OsStr]) -> IsoResult<()> {
+	pub fn clone_tree(lower: &Path, merged: &Path, options: CloneTreeOptions<'_>) -> IsoResult<()> {
 		let lower = tree::canonical_existing_dir(lower, "clone source", IsoError::other)?;
-		if let Some(parent) = merged.parent() {
-			fs::create_dir_all(parent).map_err(|err| {
-				IsoError::other(format!("unable to create parent of {}: {err}", merged.display()))
-			})?;
-		}
+		let excluded = tree::clone_excluded_path(&lower, merged)?;
 		if merged.exists() {
 			if fs::read_dir(merged)
 				.map_err(|err| IsoError::other(format!("read_dir {}: {err}", merged.display())))?
@@ -138,37 +142,52 @@ mod imp {
 				.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
 		}
 
-		let result = (|| {
-			for entry in fs::read_dir(&lower)
-				.map_err(|err| IsoError::other(format!("read_dir {}: {err}", lower.display())))?
-			{
-				let entry = entry.map_err(|err| {
-					IsoError::other(format!("dir entry in {}: {err}", lower.display()))
-				})?;
-				if skip.contains(&entry.file_name().as_os_str()) {
-					continue;
-				}
-				// `clonefile` only accepts regular files, directories, and
-				// symlinks as a top-level source (EINVAL otherwise). Sockets,
-				// fifos, and devices are process-owned ephemera — skip them, as
-				// the recursive walkers on other platforms do.
-				let file_type = entry.file_type().map_err(|err| {
-					IsoError::other(format!("file_type {}: {err}", entry.path().display()))
-				})?;
-				if !(file_type.is_file() || file_type.is_dir() || file_type.is_symlink()) {
-					continue;
-				}
-				let src = entry.path();
-				let dst = merged.join(entry.file_name());
-				cow::clonefile(&src, &dst, CLONE_NOFOLLOW)
-					.map_err(|err| clone_error(&src, &dst, &err))?;
-			}
-			Ok(())
-		})();
+		let result = tree::copy_dir_contents(
+			&lower,
+			merged,
+			CopyOptions {
+				skip:              options.skip,
+				skip_nested_repos: options.skip_nested_repos,
+				excluded:          excluded.as_deref(),
+			},
+			&ApfsClone,
+		);
 		if result.is_err() {
 			let _ = fs::remove_dir_all(merged);
 		}
 		result
+	}
+
+	struct ApfsClone;
+
+	impl TreeCopy for ApfsClone {
+		fn symlink(&self, src: &Path, dst: &Path, _: FileType) -> IsoResult<()> {
+			cow::clonefile(src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(src, dst, &err))
+		}
+
+		fn file(&self, src: &Path, dst: &Path, file_type: FileType) -> IsoResult<()> {
+			if !file_type.is_file() {
+				return Ok(());
+			}
+			cow::clonefile(src, dst, CLONE_NOFOLLOW).map_err(|err| clone_error(src, dst, &err))
+		}
+
+		fn finish_dir(&self, src: &Path, dst: &Path) -> IsoResult<()> {
+			let meta = fs::metadata(src)
+				.map_err(|err| IsoError::other(format!("metadata {}: {err}", src.display())))?;
+			fs::set_permissions(dst, meta.permissions()).map_err(|err| {
+				IsoError::other(format!("set permissions on {}: {err}", dst.display()))
+			})?;
+			let mut times = FileTimes::new();
+			if let Ok(accessed) = meta.accessed() {
+				times = times.set_accessed(accessed);
+			}
+			if let Ok(modified) = meta.modified() {
+				times = times.set_modified(modified);
+			}
+			let _ = fs::File::open(dst).and_then(|file| file.set_times(times));
+			Ok(())
+		}
 	}
 
 	pub fn stop(merged: &Path) -> IsoResult<()> {
@@ -218,7 +237,10 @@ mod tests {
 		// SAFETY: `fifo` is a valid NUL-terminated path that outlives the call.
 		assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
-		let result = backend().clone_tree(&lower, &merged, &[OsStr::new(".git")]);
+		let result = backend().clone_tree(&lower, &merged, CloneTreeOptions {
+			skip:              &[OsStr::new(".git")],
+			skip_nested_repos: true,
+		});
 		if matches!(result, Err(crate::IsoError::Unavailable(_))) {
 			let _ = fs::remove_dir_all(root);
 			return;

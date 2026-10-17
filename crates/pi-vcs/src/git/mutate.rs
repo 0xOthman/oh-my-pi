@@ -781,7 +781,10 @@ impl GitRepo {
 		}
 
 		pi_iso::backend(kind)
-			.clone_tree(self.root(), path, &[OsStr::new(".git")])
+			.clone_tree(self.root(), path, pi_iso::CloneTreeOptions {
+				skip:              &[OsStr::new(".git")],
+				skip_nested_repos: true,
+			})
 			.map_err(|err| Error::backend("git worktree add", err))?;
 		let admin = register_worktree(path, &self.info().common_dir, head)?;
 		fs::copy(&source_index, admin.join("index"))?;
@@ -2916,7 +2919,10 @@ mod tests {
 		let works = pi_iso::clone_candidates(None).into_iter().any(|kind| {
 			let _ = fs::remove_dir_all(&target);
 			pi_iso::backend(kind)
-				.clone_tree(&source, &target, &[])
+				.clone_tree(&source, &target, pi_iso::CloneTreeOptions {
+					skip:              &[],
+					skip_nested_repos: false,
+				})
 				.is_ok()
 		});
 		let _ = fs::remove_dir_all(&source);

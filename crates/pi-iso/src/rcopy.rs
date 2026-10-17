@@ -268,7 +268,16 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 	} else if meta.file_type().is_dir() {
 		std::fs::create_dir_all(dst)
 			.map_err(|err| IsoError::other(format!("create {}: {err}", dst.display())))?;
-		tree::copy_dir_contents(src, dst, &[], &Rcopy)?;
+		tree::copy_dir_contents(
+			src,
+			dst,
+			tree::CopyOptions {
+				skip:              &[],
+				skip_nested_repos: false,
+				excluded:          None,
+			},
+			&Rcopy,
+		)?;
 		Rcopy.finish_dir(src, dst)
 	} else {
 		Rcopy.file(src, dst, meta.file_type())
@@ -282,7 +291,16 @@ fn copy_path(src: &Path, dst: &Path) -> IsoResult<()> {
 fn recursive_copy(lower: &Path, merged: &Path) -> IsoResult<()> {
 	std::fs::create_dir_all(merged)
 		.map_err(|err| IsoError::other(format!("create {}: {err}", merged.display())))?;
-	tree::copy_dir_contents(lower, merged, &[], &Rcopy)
+	tree::copy_dir_contents(
+		lower,
+		merged,
+		tree::CopyOptions {
+			skip:              &[],
+			skip_nested_repos: false,
+			excluded:          None,
+		},
+		&Rcopy,
+	)
 }
 
 struct Rcopy;

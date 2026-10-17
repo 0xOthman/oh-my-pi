@@ -2,8 +2,8 @@
 //!
 //! A backend gives the caller a writable "merged" view of a read-only
 //! "lower" tree without paying for a deep copy, and tree-cloning backends can
-//! also copy-on-write clone a checkout while omitting selected top-level
-//! entries:
+//! copy-on-write clone a checkout while omitting selected root entries and
+//! nested Git repositories:
 //!
 //! - **macOS** uses `clonefile(2)` to seed an APFS copy-on-write clone.
 //! - **Linux** mounts a kernel `overlay` filesystem, falling back to
@@ -250,6 +250,14 @@ pub(crate) fn statfs_magic(path: &Path) -> Option<u32> {
 	Some(unsafe { stat.assume_init() }.f_type as u32)
 }
 
+/// Filters applied when cloning a checkout into a worktree.
+pub struct CloneTreeOptions<'a> {
+	/// Entries to omit at the checkout root, such as its `.git` directory.
+	pub skip:              &'a [&'a std::ffi::OsStr],
+	/// Omit nested directories containing a `.git` file or directory.
+	pub skip_nested_repos: bool,
+}
+
 /// Backend contract.
 ///
 /// `lower` is the read-only source tree; `merged` is the destination where
@@ -271,13 +279,14 @@ pub trait IsolationBackend: Send + Sync {
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()>;
 
-	/// Clone `lower` into `merged` copy-on-write, omitting named top-level
-	/// entries.
+	/// Clone `lower` into `merged` copy-on-write, omitting root entries and
+	/// optionally nested Git repositories. A destination inside `lower` is
+	/// excluded from traversal.
 	fn clone_tree(
 		&self,
 		_lower: &Path,
 		_merged: &Path,
-		_skip: &[&std::ffi::OsStr],
+		_options: CloneTreeOptions<'_>,
 	) -> IsoResult<()> {
 		Err(IsoError::unavailable(format!("{} cannot clone a directory tree in place", self.kind())))
 	}
