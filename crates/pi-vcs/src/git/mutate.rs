@@ -793,6 +793,13 @@ impl GitRepo {
 		let linked = Self::require(path)?;
 		let linked_repo = linked.gix()?;
 		let mut current = load_index_or_empty(&linked_repo, "git worktree add")?;
+		// The clone omits nested repositories, initialized submodules included;
+		// recreate each gitlink as the empty directory git checks out for it.
+		for entry in current.entries() {
+			if entry.mode == gix::index::entry::Mode::COMMIT {
+				fs::create_dir_all(path.join(entry.path(&current).to_path_lossy()))?;
+			}
+		}
 		if keep_changes {
 			// The clone already mirrors the source's live tree and the copied
 			// index carries its staged state. Only the stat cache is stale
@@ -831,7 +838,11 @@ impl GitRepo {
 
 		for relative in &delete {
 			let full = path.join(relative.to_path_lossy());
-			match fs::remove_file(&full) {
+			let removed = match fs::symlink_metadata(&full) {
+				Ok(meta) if meta.is_dir() => fs::remove_dir(&full),
+				_ => fs::remove_file(&full),
+			};
+			match removed {
 				Ok(()) => prune_empty_parents(path, full.parent(), &BTreeSet::new())?,
 				Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
 				Err(err) => return Err(err.into()),
@@ -2959,6 +2970,59 @@ mod tests {
 		assert_eq!(git(&linked, &["rev-parse", "HEAD"]), git(temp.path(), &["rev-parse", "HEAD"]));
 		assert_eq!(git(&linked, &["status", "--porcelain"]), "");
 		let _ = repo.worktree_remove(&linked, true);
+	}
+
+	#[test]
+	fn clone_first_worktree_materializes_skipped_submodules() {
+		// The clone omits every nested repository; an initialized submodule
+		// must still come out as the empty directory git checks out for a
+		// gitlink, or the new worktree reports it deleted. A target without
+		// the gitlink must not keep that directory.
+		for (target, keep_changes) in [("HEAD", false), ("HEAD", true), ("HEAD~1", false)] {
+			let (temp, repo) = fixture();
+			let upstream = tempfile::tempdir().unwrap();
+			git(upstream.path(), &["init", "-q", "-b", "main"]);
+			fs::write(upstream.path().join("lib"), "lib\n").unwrap();
+			git(upstream.path(), &["add", "."]);
+			git(upstream.path(), &[
+				"-c",
+				"user.name=Test",
+				"-c",
+				"user.email=test@example.com",
+				"commit",
+				"-qm",
+				"lib",
+			]);
+			git(temp.path(), &[
+				"-c",
+				"protocol.file.allow=always",
+				"submodule",
+				"add",
+				"-q",
+				upstream.path().to_str().unwrap(),
+				"deps/sub",
+			]);
+			git(temp.path(), &["commit", "-qm", "add submodule"]);
+			assert!(temp.path().join("deps/sub/.git").is_file());
+
+			let linked = temp
+				.path()
+				.join(format!("../linked-submodule-{target}-{keep_changes}"));
+			let _ = fs::remove_dir_all(&linked);
+			let clone_works = clone_works_on(temp.path());
+			let result = repo
+				.worktree_add(&linked, target, WorktreeAddOptions {
+					detach: true,
+					clone: WorktreeClone::Auto,
+					keep_changes,
+				})
+				.unwrap();
+			assert_eq!(result.cloned_with.is_some(), clone_works, "{:?}", result.clone_error);
+			assert_eq!(linked.join("deps/sub").is_dir(), target == "HEAD");
+			assert!(!linked.join("deps/sub/.git").exists(), "submodule checkout was copied");
+			assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+			let _ = repo.worktree_remove(&linked, true);
+		}
 	}
 
 	#[test]
