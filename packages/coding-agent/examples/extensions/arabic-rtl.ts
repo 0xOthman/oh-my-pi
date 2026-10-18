@@ -4,19 +4,20 @@
  * conversation, model, and omp-copy text stay unchanged. Terminal drag-selection
  * necessarily copies visual glyphs; use omp's copy command for logical text.
  *
- * Composer has no supported output-transform hook: the two prototype wrappers
- * below cover transcript/history, the composer, and resize replay. Fullscreen
- * overlays and native Tern surfaces retain their own renderers. Wrapping is still
- * omp's word wrapping; Left/Right retain the editor's logical navigation.
- * The wrappers affect every Composer in this process, including SDK sessions.
- * /reload neither replaces nor removes them: remove this file and fully restart
- * omp to uninstall; fully restart after upgrades to these Composer interfaces.
+ * Composer has no supported output-transform hook: the wrappers below cover
+ * transcript/history, built-in editor shapes, and resize replay. Editor text is
+ * transformed at ComposerRowContext.text, before gutters, padding, and borders.
+ * Other fullscreen overlays and native Tern surfaces retain their renderers.
+ * Word wrapping and logical Left/Right navigation remain unchanged.
+ * The wrappers affect every Composer and built-in shape in this process,
+ * including SDK sessions. /reload neither replaces nor removes them: remove this
+ * file and fully restart omp to uninstall; restart after Composer API upgrades.
  * Do not apply this on a bidi-native terminal.
  */
 import * as ffi from "bun:ffi";
 import { type Library, ptr, toArrayBuffer } from "bun:ffi";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { CURSOR_MARKER, visibleWidth } from "@oh-my-pi/pi-tui";
+import { BUILTIN_EDITOR_BORDER_STYLES, CURSOR_MARKER, getComposerStyle, visibleWidth } from "@oh-my-pi/pi-tui";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 
 const RTL = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufeff]/;
@@ -47,13 +48,15 @@ interface Cluster extends Style {
 	rtl: boolean;
 }
 
-/** One renderer per process; ASCII rows never call ICU or allocate row caches. */
-export function createArabicRowRenderer(): (row: string) => string {
+/** One renderer per process; editor text never contains inferred UI padding. */
+export function createArabicRowRenderer(): (row: string, editorText?: boolean) => string {
 	let library: Library<typeof ICU_FUNCTIONS> | undefined;
-	const cache = new Map<string, string>();
+	const transcriptCache = new Map<string, string>();
+	const editorCache = new Map<string, string>();
 
-	return function renderArabicRow(row: string): string {
+	return function renderArabicRow(row: string, editorText = false): string {
 		if (!RTL.test(row)) return row;
+		const cache = editorText ? editorCache : transcriptCache;
 		const cached = cache.get(row);
 		if (cached !== undefined) return cached;
 
@@ -142,14 +145,14 @@ export function createArabicRowRenderer(): (row: string) => string {
 				});
 			}
 			const visual: Cluster[] = [];
-			// Layout cell separators are not prose: never reorder separate table cells.
+			// Only transcript rows contain layout cell separators; editor text is prose.
 			for (let first = 0; first < logical.length;) {
-				if (CELL_BORDER.test(logical[first].text)) {
+				if (!editorText && CELL_BORDER.test(logical[first].text)) {
 					visual.push(logical[first++]);
 					continue;
 				}
 				let last = first + 1;
-				while (last < logical.length && !CELL_BORDER.test(logical[last].text)) last++;
+				while (last < logical.length && (editorText || !CELL_BORDER.test(logical[last].text))) last++;
 				const cellStart = logical[first].start;
 				const cellEnd = logical[last - 1].end;
 				const cell = plain.slice(cellStart, cellEnd);
@@ -158,15 +161,10 @@ export function createArabicRowRenderer(): (row: string) => string {
 					first = last;
 					continue;
 				}
-				// Padding, Composer gutters (band or prompt), and list markers belong
-				// to the UI, not the paragraph. Continuation gutters are plain spaces.
-				const prefix = /^\s*(?:(?:╰─|❯)\s+)?(?:(?:[-*+•]|\d+[.)])\s+)?/.exec(cell)![0].length;
-				// The marker was removed above, but spaces typed before it are still
-				// paragraph text. Only whitespace after the logical cursor can be padding.
-				const suffix = Math.min(
-					/\s*$/.exec(cell)![0].length,
-					cursor >= cellStart && cursor <= cellEnd ? cellEnd - cursor : cell.length,
-				);
+				// Transcript indentation and list markers are UI. Editor text arrives
+				// separately from chrome, so every user-entered space belongs to bidi.
+				const prefix = editorText ? 0 : /^\s*(?:(?:[-*+•]|\d+[.)])\s+)?/.exec(cell)![0].length;
+				const suffix = editorText ? 0 : /\s*$/.exec(cell)![0].length;
 				let runFirst = first;
 				while (runFirst < last && logical[runFirst].end <= cellStart + prefix) visual.push(logical[runFirst++]);
 				let runLast = last;
@@ -286,18 +284,49 @@ export default function arabicRtlExtension(_pi: ExtensionAPI): void {
 	const prototype: PatchedComposer = Composer.prototype;
 	if (prototype[installed]) return;
 	const renderRow = createArabicRowRenderer();
+	let frameDepth = 0;
+	const editorRowMarker = "\x1b_omp:arabic:editor\x1b\\";
+	for (const id of BUILTIN_EDITOR_BORDER_STYLES) {
+		const style = getComposerStyle(id);
+		const render = style.renderRow;
+		style.renderRow = function (context) {
+			const text = renderRow(context.text, true);
+			const rows = render.call(this, text === context.text ? context : { ...context, text });
+			// Shape output is mutable. Tag only framed RTL rows so the outer
+			// transcript transform cannot reorder editor text or its chrome twice.
+			if (frameDepth > 0) {
+				for (let i = 0; i < rows.length; i++) {
+					if (RTL.test(rows[i])) rows[i] = editorRowMarker + rows[i];
+				}
+			}
+			return rows;
+		};
+	}
+	function renderFrameRow(row: string): string {
+		return row.includes(editorRowMarker) ? row.replaceAll(editorRowMarker, "") : renderRow(row);
+	}
 	const renderFrame = prototype.renderFrame;
 	const renderResizeFrame = prototype.renderResizeFrame;
 	prototype.renderFrame = function (viewport) {
-		const plan = renderFrame.call(this, viewport);
-		return {
-			...plan,
-			viewport: plan.viewport.map(renderRow),
-			...(plan.history ? { history: { ...plan.history, rows: plan.history.rows.map(renderRow) } } : {}),
-		};
+		frameDepth++;
+		try {
+			const plan = renderFrame.call(this, viewport);
+			return {
+				...plan,
+				viewport: plan.viewport.map(renderFrameRow),
+				...(plan.history ? { history: { ...plan.history, rows: plan.history.rows.map(renderFrameRow) } } : {}),
+			};
+		} finally {
+			frameDepth--;
+		}
 	};
 	prototype.renderResizeFrame = function (viewport) {
-		return renderResizeFrame.call(this, viewport).map(renderRow);
+		frameDepth++;
+		try {
+			return renderResizeFrame.call(this, viewport).map(renderFrameRow);
+		} finally {
+			frameDepth--;
+		}
 	};
 	prototype[installed] = true;
 }

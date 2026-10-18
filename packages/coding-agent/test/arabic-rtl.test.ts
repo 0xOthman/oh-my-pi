@@ -1,12 +1,42 @@
 import * as ffi from "bun:ffi";
 import { afterEach, describe, expect, spyOn, test, vi } from "bun:test";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import * as tui from "@oh-my-pi/pi-tui";
-import { CURSOR_MARKER, visibleWidth } from "@oh-my-pi/pi-tui";
-import { createArabicRowRenderer } from "../examples/extensions/arabic-rtl";
+import {
+	BUILTIN_EDITOR_BORDER_STYLES,
+	type ComposerRowContext,
+	CURSOR_MARKER,
+	getComposerStyle,
+	visibleWidth,
+} from "@oh-my-pi/pi-tui";
+import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
+import arabicRtlExtension, { createArabicRowRenderer } from "../examples/extensions/arabic-rtl";
 
 afterEach(() => {
 	vi.restoreAllMocks();
 });
+
+function withArabicExtension<T>(run: () => T): T {
+	const prototype = Composer.prototype;
+	const frame = prototype.renderFrame;
+	const resize = prototype.renderResizeFrame;
+	const installed = Symbol.for("omp.arabic-rtl.composer.v1");
+	const descriptor = Object.getOwnPropertyDescriptor(prototype, installed);
+	const styles = BUILTIN_EDITOR_BORDER_STYLES.map(id => {
+		const style = getComposerStyle(id);
+		return { style, renderRow: style.renderRow };
+	});
+	try {
+		arabicRtlExtension({} as ExtensionAPI);
+		return run();
+	} finally {
+		for (const { style, renderRow } of styles) style.renderRow = renderRow;
+		prototype.renderFrame = frame;
+		prototype.renderResizeFrame = resize;
+		if (descriptor) Object.defineProperty(prototype, installed, descriptor);
+		else Reflect.deleteProperty(prototype, installed);
+	}
+}
 
 describe("Arabic display failure safety", () => {
 	test("an unavailable native library preserves the complete row and is retried", () => {
@@ -67,28 +97,6 @@ describe.skipIf(process.platform !== "win32")("Windows Arabic display extension"
 		expect(visibleWidth(visual)).toBe(visibleWidth(row));
 	});
 
-	test.each(["╰─ ", "❯ "])("the %s Composer gutter stays left of Arabic input and its cursor", gutter => {
-		const render = createArabicRowRenderer();
-		const row = `${gutter}بت${CURSOR_MARKER}   `;
-		const visual = render(row);
-		expect(Bun.stripANSI(visual.replace(CURSOR_MARKER, ""))).toBe(`${gutter}\ufe96\ufe91   `);
-		expect(visibleWidth(visual.slice(0, visual.indexOf(CURSOR_MARKER)))).toBe(visibleWidth(gutter));
-		expect(visual.split(CURSOR_MARKER)).toHaveLength(2);
-		expect(visibleWidth(visual)).toBe(visibleWidth(row));
-	});
-
-	test("styled band and blank continuation gutters stay aligned across Arabic rows", () => {
-		const render = createArabicRowRenderer();
-		const rows = ["\x1b[36m╰─ \x1b[0m\x1b[31mبت\x1b[0m   ", `   بت${CURSOR_MARKER}   `];
-		const visual = rows.map(render);
-		expect(Bun.stripANSI(visual[0])).toBe("╰─ \ufe96\ufe91   ");
-		expect(visual[0]).toContain("\x1b[36m╰─ ");
-		expect(visual[0]).toContain("\x1b[31m\ufe96\ufe91");
-		expect(Bun.stripANSI(visual[1].replace(CURSOR_MARKER, ""))).toBe("   \ufe96\ufe91   ");
-		expect(visibleWidth(visual[1].slice(0, visual[1].indexOf(CURSOR_MARKER)))).toBe(3);
-		expect(visual.map(visibleWidth)).toEqual(rows.map(visibleWidth));
-	});
-
 	test("the logical end-of-word cursor is placed at the visual left boundary", () => {
 		const render = createArabicRowRenderer();
 		const row = `بت${CURSOR_MARKER}`;
@@ -99,24 +107,57 @@ describe.skipIf(process.platform !== "win32")("Windows Arabic display extension"
 		expect(visibleWidth(visual)).toBe(visibleWidth(row));
 	});
 
-	test.each(["", "╰─ "])("typed trailing spaces precede the visual Arabic word with gutter %j", gutter => {
+	test.each([0, 5, 6, 7])("editor caret %i preserves typed whitespace on both sides", cursor => {
 		const render = createArabicRowRenderer();
-		const row = `${gutter}مرحبا ${CURSOR_MARKER}    `;
-		const visual = render(row);
-		expect(Bun.stripANSI(visual.replace(CURSOR_MARKER, ""))).toBe(`${gutter} \ufe8e\ufe92\ufea3\ufeae\ufee3    `);
-		expect(visibleWidth(visual.slice(0, visual.indexOf(CURSOR_MARKER)))).toBe(visibleWidth(gutter));
+		const text = "مرحبا  ";
+		const row = text.slice(0, cursor) + CURSOR_MARKER + text.slice(cursor);
+		const visual = render(row, true);
+		expect(Bun.stripANSI(visual.replace(CURSOR_MARKER, ""))).toBe("  \ufe8e\ufe92\ufea3\ufeae\ufee3");
+		expect(visibleWidth(visual.slice(0, visual.indexOf(CURSOR_MARKER)))).toBe(text.length - cursor);
 		expect(visual.split(CURSOR_MARKER)).toHaveLength(2);
 		expect(visibleWidth(visual)).toBe(visibleWidth(row));
 	});
 
-	test("the logical start cursor stays at the opposite boundary from the Arabic end cursor", () => {
+	test("editor text and padded transcript rows do not share cached layout", () => {
 		const render = createArabicRowRenderer();
-		const row = `╰─ ${CURSOR_MARKER}مرحبا     `;
-		const visual = render(row);
-		expect(Bun.stripANSI(visual.replace(CURSOR_MARKER, ""))).toBe("╰─ \ufe8e\ufe92\ufea3\ufeae\ufee3     ");
-		expect(visibleWidth(visual.slice(0, visual.indexOf(CURSOR_MARKER)))).toBe(8);
-		expect(visual.split(CURSOR_MARKER)).toHaveLength(2);
-		expect(visibleWidth(visual)).toBe(visibleWidth(row));
+		const row = "مرحبا ";
+		expect(Bun.stripANSI(render(row))).toBe("\ufe8e\ufe92\ufea3\ufeae\ufee3 ");
+		expect(Bun.stripANSI(render(row, true))).toBe(" \ufe8e\ufe92\ufea3\ufeae\ufee3");
+		expect(Bun.stripANSI(render(row))).toBe("\ufe8e\ufe92\ufea3\ufeae\ufee3 ");
+	});
+
+	test.each([...BUILTIN_EDITOR_BORDER_STYLES])("the %s shape preserves chrome and padding around typed spaces", id => {
+		const style = getComposerStyle(id);
+		const color = (text: string): string => text;
+		const context: ComposerRowContext = {
+			width: 30,
+			paddingX: style.defaultPaddingX(undefined),
+			borderColor: color,
+			accentColor: color,
+			surfaceColor: color,
+			box: { topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", horizontal: "─", vertical: "│" },
+			text: `مرحبا${CURSOR_MARKER} `,
+			pad: "    ",
+			gutter: style.defaultPromptGutter ?? "",
+			isLastRow: true,
+			cursorOverflow: 0,
+			imeSafeCursorTail: false,
+			scrollbarThumb: false,
+		};
+		const logical = style.renderRow(context);
+		withArabicExtension(() => {
+			const visual = style.renderRow(context);
+			expect(visual.map(row => Bun.stripANSI(row.replace(CURSOR_MARKER, "")))).toEqual(
+				logical.map(row =>
+					Bun.stripANSI(row.replace(CURSOR_MARKER, "")).replace("مرحبا ", " \ufe8e\ufe92\ufea3\ufeae\ufee3"),
+				),
+			);
+			const word = logical[0].indexOf("مرحبا");
+			expect(visibleWidth(visual[0].slice(0, visual[0].indexOf(CURSOR_MARKER)))).toBe(
+				visibleWidth(logical[0].slice(0, word)) + 1,
+			);
+			expect(visual.map(visibleWidth)).toEqual(logical.map(visibleWidth));
+		});
 	});
 
 	test("a width-changing transform preserves the row and can recover without a stale cache", () => {
