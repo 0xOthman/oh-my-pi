@@ -161,9 +161,9 @@ export function createArabicRowRenderer(): (row: string, editorText?: boolean) =
 					first = last;
 					continue;
 				}
-				// Transcript indentation and list markers are UI. Editor text arrives
-				// separately from chrome, so every user-entered space belongs to bidi.
-				const prefix = editorText ? 0 : /^\s*(?:(?:[-*+•]|\d+[.)])\s+)?/.exec(cell)![0].length;
+				// Transcript indentation, leading quote/callout rails, and list
+				// markers are UI. Editor text is already separate from its chrome.
+				const prefix = editorText ? 0 : /^\s*(?:[▏▎]\s*)*(?:(?:[-*+•]|\d+[.)])\s+)?/.exec(cell)![0].length;
 				const suffix = editorText ? 0 : /\s*$/.exec(cell)![0].length;
 				let runFirst = first;
 				while (runFirst < last && logical[runFirst].end <= cellStart + prefix) visual.push(logical[runFirst++]);

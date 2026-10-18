@@ -97,6 +97,17 @@ describe.skipIf(process.platform !== "win32")("Windows Arabic display extension"
 		expect(visibleWidth(visual)).toBe(visibleWidth(row));
 	});
 
+	test("leading quote and callout rails stay fixed without treating inline rails as chrome", () => {
+		const render = createArabicRowRenderer();
+		const row = "  \x1b[36m▏\x1b[0m \x1b[33m▎\x1b[0mمرحبا";
+		const visual = render(row);
+		expect(Bun.stripANSI(visual)).toBe("  ▏ ▎\ufe8e\ufe92\ufea3\ufeae\ufee3");
+		expect(visual).toContain("\x1b[36m▏");
+		expect(visual).toContain("\x1b[33m▎");
+		expect(visibleWidth(visual)).toBe(visibleWidth(row));
+		expect(Bun.stripANSI(render("مرحبا ▏ path"))).toBe("path ▏ \ufe8e\ufe92\ufea3\ufeae\ufee3");
+	});
+
 	test("the logical end-of-word cursor is placed at the visual left boundary", () => {
 		const render = createArabicRowRenderer();
 		const row = `بت${CURSOR_MARKER}`;

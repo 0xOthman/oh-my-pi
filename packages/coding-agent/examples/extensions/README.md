@@ -74,6 +74,16 @@ and other fullscreen overlays retain their own renderers.
 Rows that fail shaping, bidi ordering, or the terminal-width check are emitted
 unchanged; failed rows are not cached, so later renders can recover.
 
+Leading Unicode quote and callout rails (`▏`, `▎`) stay outside bidi ordering;
+the same glyphs inside prose remain part of the paragraph.
+
+Transcript cell boundaries still rely on border glyphs rather than semantic row
+metadata. Literal pipes or border-shaped characters in ordinary text can be
+misclassified as cell dividers. ASCII quote chrome and literal leading pipes can
+produce identical physical rows, so a general fix requires source/row-kind
+metadata or an earlier supported hook. This limitation is not resolved by the
+Unicode rail fix.
+
 Bidirectional ordering is row-local, after existing word wrapping. The frame
 strings do not identify paragraph boundaries or soft-wrap continuations. A
 continuation beginning with English can therefore choose a different base
