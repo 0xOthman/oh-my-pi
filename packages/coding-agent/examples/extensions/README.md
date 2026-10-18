@@ -65,8 +65,25 @@ not stored messages or model input. Use omp's copy command for original logical
 text; terminal drag-selection copies the displayed presentation glyphs.
 Arrow keys still navigate logical text, not visual order. Existing word wrapping
 is unchanged; fullscreen overlays and native Tern surfaces are not transformed.
-It wraps internal Composer prototype methods, so compatibility must be checked
-after omp upgrades. This is an opt-in extension, not global RTL support.
+Rows that fail shaping, bidi ordering, or the terminal-width check are emitted
+unchanged; failed rows are not cached, so later renders can recover.
+
+The patch is process-wide: it affects every Composer instance, including other
+sessions in an SDK host. Do not use it where sessions need independent display
+settings. `/reload` does not undo the patch or replace an already installed copy;
+remove the file and fully restart omp to uninstall it. It wraps internal Composer
+prototype methods with no stability contract, so compatibility must be checked
+after omp upgrades. This is an opt-in workaround, not general RTL support.
+
+Run the example's regression coverage from the repository root:
+
+```bash
+bun test packages/coding-agent/test/arabic-rtl.test.ts
+```
+
+Native-library failure and opaque-terminal-command cases run on every platform.
+Real ICU shaping and caret-layout cases require Windows; the Linux CI jobs do
+not exercise those native cases.
 
 ### Git Integration
 
