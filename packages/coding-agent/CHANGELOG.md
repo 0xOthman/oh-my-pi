@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added an opt-in Windows extension example for Arabic letter joining and bidirectional display in the transcript and composer ([#16083](https://github.com/can1357/oh-my-pi/pull/16083) by [@0xOthman](https://github.com/0xOthman)).
+- Added an opt-in Windows extension example for per-row Arabic letter joining and bidirectional display in the transcript and composer, preserving original rows when transformation fails ([#16083](https://github.com/can1357/oh-my-pi/pull/16083) by [@0xOthman](https://github.com/0xOthman)).
 - Added DeepSeek as a web search engine (`web/deepseek`), using DeepSeek's new Search API with your existing `DEEPSEEK_API_KEY` or stored `deepseek` credential
 - Added `el.selectText(text, { prefix?, suffix?, select? })` to the macOS `computer` tool: it selects text (or places a caret) in a background app's text field without taking focus, moving the pointer or sending keys, so typing into that field replaces it ([#15175](https://github.com/can1357/oh-my-pi/pull/15175) by [@will-bogusz](https://github.com/will-bogusz))
 - Added `{ takeover: true }` to computer-use `win.move`, so a hover that a window refuses in the background can be retried in the foreground ([#15173](https://github.com/can1357/oh-my-pi/pull/15173) by [@will-bogusz](https://github.com/will-bogusz))

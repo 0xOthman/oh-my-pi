@@ -68,6 +68,13 @@ is unchanged; fullscreen overlays and native Tern surfaces are not transformed.
 Rows that fail shaping, bidi ordering, or the terminal-width check are emitted
 unchanged; failed rows are not cached, so later renders can recover.
 
+Bidirectional ordering is row-local, after existing word wrapping. The frame
+strings do not identify paragraph boundaries or soft-wrap continuations. A
+continuation beginning with English can therefore choose a different base
+direction from its original Arabic paragraph. Correct paragraph-level layout
+requires an earlier paragraph-aware hook or wrap metadata; this example does
+not infer paragraph direction from neighbouring rows.
+
 The patch is process-wide: it affects every Composer instance, including other
 sessions in an SDK host. Do not use it where sessions need independent display
 settings. `/reload` does not undo the patch or replace an already installed copy;
